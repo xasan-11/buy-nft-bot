@@ -1,0 +1,22 @@
+.env
+.venv/
+venv/
+__pycache__/
+*.pyc
+
+# Telegram sessions and local database — never commit these
+data/
+*.session
+*.session-journal
+
+# Editors / OS
+.idea/
+.vscode/
+.DS_Store
+
+# Test artifacts
+.pytest_cache/
+
+# Logs and any other locally-generated secrets/data
+*.log
+*.env.local

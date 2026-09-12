@@ -291,4 +291,5 @@ Tests never talk to real Telegram servers — the purchase pipeline and
 marketplace calls are exercised against fakes/mocks (see
 `tests/test_marketplace_purchase.py` and `tests/test_purchase_pipeline.py`).
 #   b u y - n f t - b o t  
+ #   b u y - n f t - b o t  
  

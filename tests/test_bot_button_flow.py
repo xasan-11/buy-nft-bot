@@ -8,8 +8,8 @@ from telethon.tl import functions
 from src.bot import gift_picker
 from src.bot.bot_app import register_bot_handlers
 from src.monitoring.channel_monitor import ChannelMonitor, MonitorState
-from src.monitoring.offer_state import OfferState
-from tests.conftest import ADMIN_ID, OWNER_ID
+from src.monitoring.offer_registry import OfferRegistry
+from tests.conftest import ADMIN_ID, OWNER_ID, STRANGER_ID
 
 _message_id_counter = itertools.count(1)
 
@@ -142,7 +142,32 @@ class FakeNotifier:
         return _noop
 
 
-async def make_bot(repo, gift_types=None):
+class FakeSessionManager:
+    """Stand-in for telegram/user_manager.UserSessionManager: only the
+    surface bot_app.py actually touches (is_ready/get_client, plus
+    recording /login attempts) — never talks to real Telegram."""
+
+    def __init__(self, clients=None, ready=None):
+        self._clients = clients or {}
+        self._ready = set(ready or ())
+        self.login_calls = []
+
+    def is_ready(self, telegram_id: int) -> bool:
+        return telegram_id in self._ready
+
+    def get_client(self, telegram_id: int):
+        return self._clients.get(telegram_id)
+
+    async def handle_login_command(self, telegram_id, phone, event):
+        self.login_calls.append((telegram_id, phone))
+        await event.respond(f"📩 Kod yuborildi (fake) — {phone or 'no phone given'}")
+
+
+async def make_bot(repo, gift_types=None, logged_in_user_id=None):
+    """`logged_in_user_id` (defaults to ADMIN_ID) is treated as already
+    having completed /login — its own FakeUserClient is what the gift-type
+    picker fetches gift types from."""
+    logged_in_user_id = ADMIN_ID if logged_in_user_id is None else logged_in_user_id
     await repo.add_admin(ADMIN_ID, added_by=OWNER_ID)
     bot_client = FakeBotClient()
     user_client = FakeUserClient(gift_types)
@@ -152,57 +177,84 @@ async def make_bot(repo, gift_types=None):
     await state.load()
     market_state = MonitorState(repo, key="market_monitoring_status")
     await market_state.load()
-    offer_state = OfferState(repo)
-    await offer_state.load()
+    offer_registry = OfferRegistry(repo)
+    session_manager = FakeSessionManager(
+        clients={logged_in_user_id: user_client}, ready={logged_in_user_id}
+    )
 
-    register_bot_handlers(bot_client, repo, monitor, state, notifier, market_state, offer_state)
-    return bot_client, offer_state
+    register_bot_handlers(
+        bot_client, repo, monitor, state, notifier, market_state, offer_registry, session_manager
+    )
+    return bot_client, offer_registry, session_manager
 
+
+# --------------------------------------------------------- owner-only actions
 
 async def test_status_button_runs_do_status(repo):
-    bot_client, _ = await make_bot(repo)
+    bot_client, *_ = await make_bot(repo)
 
-    fired = await bot_client.send("📊 Holat", ADMIN_ID)
+    fired = await bot_client.send("📊 Holat", OWNER_ID)
 
     texts = [r["text"] for e in fired for r in e.responses]
     assert any("Status" in t for t in texts if t)
 
 
-async def test_setmaxprice_button_prompts_then_applies_value(repo):
-    bot_client, _ = await make_bot(repo)
+async def test_status_button_rejects_non_owner_admin(repo):
+    """Being listed as an admin no longer grants channel/market-monitoring
+    capability under the multi-tenant model — only the owner gets it."""
+    bot_client, *_ = await make_bot(repo)
 
-    prompt_events = await bot_client.send("💰 Max narx", ADMIN_ID)
+    fired = await bot_client.send("📊 Holat", ADMIN_ID)
+
+    texts = [r["text"] for e in fired for r in e.responses]
+    assert any("not authorized" in (t or "").lower() for t in texts)
+
+
+async def test_setmaxprice_button_prompts_then_applies_value(repo):
+    bot_client, *_ = await make_bot(repo)
+
+    prompt_events = await bot_client.send("💰 Max narx", OWNER_ID)
     assert any("narx" in (r["text"] or "").lower() for e in prompt_events for r in e.responses)
 
-    reply_events = await bot_client.send("300", ADMIN_ID)
+    reply_events = await bot_client.send("300", OWNER_ID)
     assert await repo.get_max_price() == 300
     assert any("300" in (r["text"] or "") for e in reply_events for r in e.responses)
 
 
-async def test_setmaxprice_button_reprompts_on_invalid_value(repo):
-    bot_client, _ = await make_bot(repo)
+async def test_setmaxprice_button_rejects_non_owner_admin(repo):
+    bot_client, *_ = await make_bot(repo)
 
-    await bot_client.send("💰 Max narx", ADMIN_ID)
-    await bot_client.send("not-a-number", ADMIN_ID)
+    fired = await bot_client.send("💰 Max narx", ADMIN_ID)
+
+    texts = [r["text"] for e in fired for r in e.responses]
+    assert any("not authorized" in (t or "").lower() for t in texts)
+    assert await repo.get_max_price() == 200  # unchanged
+
+
+async def test_setmaxprice_button_reprompts_on_invalid_value(repo):
+    bot_client, *_ = await make_bot(repo)
+
+    await bot_client.send("💰 Max narx", OWNER_ID)
+    await bot_client.send("not-a-number", OWNER_ID)
     assert await repo.get_max_price() == 200  # unchanged
 
     # still pending -> a valid value now succeeds
-    await bot_client.send("500", ADMIN_ID)
+    await bot_client.send("500", OWNER_ID)
     assert await repo.get_max_price() == 500
 
 
 async def test_fresh_button_tap_cancels_stale_pending_flow(repo):
-    bot_client, _ = await make_bot(repo)
+    bot_client, *_ = await make_bot(repo)
 
-    await bot_client.send("💰 Max narx", ADMIN_ID)  # start a setmaxprice flow
-    await bot_client.send("📊 Holat", ADMIN_ID)  # change their mind, tap another button
-    await bot_client.send("300", ADMIN_ID)  # this must NOT be swallowed as the old prompt's answer
+    await bot_client.send("💰 Max narx", OWNER_ID)  # start a setmaxprice flow
+    await bot_client.send("📊 Holat", OWNER_ID)  # change their mind, tap another button
+    await bot_client.send("300", OWNER_ID)  # this must NOT be swallowed as the old prompt's answer
 
     assert await repo.get_max_price() == 200  # setmaxprice flow was abandoned, never applied
 
 
 async def test_addadmin_button_rejects_non_owner_admin(repo):
-    bot_client, _ = await make_bot(repo)  # make_bot already seeds ADMIN_ID as a non-owner admin
+    bot_client, *_ = await make_bot(repo)  # make_bot already seeds ADMIN_ID as a non-owner admin
 
     fired = await bot_client.send("👤➕ Admin qo'sh", ADMIN_ID)
 
@@ -211,8 +263,13 @@ async def test_addadmin_button_rejects_non_owner_admin(repo):
     assert not await repo.is_admin(999999)
 
 
+# ------------------------------------------------------- offer-tashlash actions
+# Available to ANY user — owner, admin, or a total stranger who has never
+# been added anywhere — the whole point of the multi-tenant rework.
+
 async def test_stop_offer_button_stops_immediately(repo):
-    bot_client, offer_state = await make_bot(repo)
+    bot_client, offer_registry, _ = await make_bot(repo)
+    offer_state = await offer_registry.get(ADMIN_ID)
     await offer_state.start()
 
     fired = await bot_client.send("🛑 Offer to'xtatish", ADMIN_ID)
@@ -220,6 +277,36 @@ async def test_stop_offer_button_stops_immediately(repo):
     assert offer_state.is_active() is False
     texts = [r["text"] for e in fired for r in e.responses]
     assert any("to'xtatildi" in (t or "") for t in texts)
+
+
+async def test_stranger_can_use_offer_settings_without_being_an_admin(repo):
+    bot_client, *_ = await make_bot(repo)
+
+    await bot_client.send("💸 Offer narxi", STRANGER_ID)
+    reply_events = await bot_client.send("150", STRANGER_ID)
+
+    assert await repo.get_user_offer_price(STRANGER_ID) == 150
+    # the owner's/admin's own settings are untouched
+    assert await repo.get_user_offer_price(OWNER_ID) == 125
+    assert any("150" in (r["text"] or "") for e in reply_events for r in e.responses)
+
+
+async def test_stranger_cannot_use_owner_only_actions(repo):
+    bot_client, *_ = await make_bot(repo)
+
+    fired = await bot_client.send("🟢 Kanal boshlash", STRANGER_ID)
+
+    texts = [r["text"] for e in fired for r in e.responses]
+    assert any("not authorized" in (t or "").lower() for t in texts)
+
+
+async def test_login_button_prompts_then_forwards_to_session_manager(repo):
+    bot_client, _, session_manager = await make_bot(repo)
+
+    await bot_client.send("🔑 Kirish (Login)", STRANGER_ID)
+    await bot_client.send("+998901112233", STRANGER_ID)
+
+    assert session_manager.login_calls == [(STRANGER_ID, "+998901112233")]
 
 
 # ------------------------------------------------------- gift-type picker flow
@@ -230,7 +317,7 @@ async def test_start_offer_button_opens_picker_with_one_message_per_resalable_gi
         FakeStarGiftType(2, stars=200, availability_resale=None, title="Not Resalable"),
         FakeStarGiftType(3, stars=150, availability_resale=2, title="Desk Calendar"),
     ]
-    bot_client, _ = await make_bot(repo, gift_types=gift_types)
+    bot_client, *_ = await make_bot(repo, gift_types=gift_types)
 
     fired = await bot_client.send("🎯 Offer boshlash", ADMIN_ID)
 
@@ -251,8 +338,17 @@ async def test_start_offer_button_opens_picker_with_one_message_per_resalable_gi
     assert any(gift_picker.FALLBACK_EMOJI in t for t in button_texts)
 
 
+async def test_start_offer_button_requires_login_first(repo):
+    bot_client, *_ = await make_bot(repo, logged_in_user_id=ADMIN_ID)
+
+    fired = await bot_client.send("🎯 Offer boshlash", STRANGER_ID)  # never logged in
+
+    texts = [r["text"] for e in fired for r in e.responses]
+    assert any("ulang" in (t or "").lower() or "login" in (t or "").lower() for t in texts)
+
+
 async def test_start_offer_button_shows_no_gifts_message_when_none_resalable(repo):
-    bot_client, _ = await make_bot(repo, gift_types=[FakeStarGiftType(1, availability_resale=None)])
+    bot_client, *_ = await make_bot(repo, gift_types=[FakeStarGiftType(1, availability_resale=None)])
 
     fired = await bot_client.send("🎯 Offer boshlash", ADMIN_ID)
 
@@ -262,7 +358,7 @@ async def test_start_offer_button_shows_no_gifts_message_when_none_resalable(rep
 
 async def test_gift_toggle_callback_flips_selection_and_edits_button(repo):
     gift_types = [FakeStarGiftType(1, stars=100, availability_resale=5, title="Plush Pepe")]
-    bot_client, _ = await make_bot(repo, gift_types=gift_types)
+    bot_client, *_ = await make_bot(repo, gift_types=gift_types)
     await bot_client.send("🎯 Offer boshlash", ADMIN_ID)
 
     fired = await bot_client.send_callback("giftsel:1", ADMIN_ID)
@@ -280,7 +376,7 @@ async def test_gift_toggle_callback_flips_selection_and_edits_button(repo):
 
 async def test_gift_start_callback_without_selection_shows_alert_and_does_not_start(repo):
     gift_types = [FakeStarGiftType(1, stars=100, availability_resale=5, title="Plush Pepe")]
-    bot_client, offer_state = await make_bot(repo, gift_types=gift_types)
+    bot_client, offer_registry, _ = await make_bot(repo, gift_types=gift_types)
     await bot_client.send("🎯 Offer boshlash", ADMIN_ID)
 
     fired = await bot_client.send_callback("giftstart", ADMIN_ID)
@@ -288,6 +384,7 @@ async def test_gift_start_callback_without_selection_shows_alert_and_does_not_st
     assert len(fired) == 1
     assert fired[0].answers[0]["kwargs"].get("alert") is True
     assert "kamida bitta" in fired[0].answers[0]["message"]
+    offer_state = await offer_registry.get(ADMIN_ID)
     assert offer_state.is_active() is False
 
 
@@ -296,14 +393,15 @@ async def test_gift_start_callback_with_selection_persists_and_starts_unbounded(
         FakeStarGiftType(1, stars=100, availability_resale=5, title="Plush Pepe"),
         FakeStarGiftType(2, stars=200, availability_resale=3, title="Desk Calendar"),
     ]
-    bot_client, offer_state = await make_bot(repo, gift_types=gift_types)
+    bot_client, offer_registry, _ = await make_bot(repo, gift_types=gift_types)
     await bot_client.send("🎯 Offer boshlash", ADMIN_ID)
     await bot_client.send_callback("giftsel:2", ADMIN_ID)
 
     fired = await bot_client.send_callback("giftstart", ADMIN_ID)
 
+    offer_state = await offer_registry.get(ADMIN_ID)
     assert offer_state.is_active() is True  # unbounded — no target-count concept exists
-    assert await repo.get_offer_selected_gift_types() == {2}
+    assert await repo.get_user_offer_selected_gift_types(ADMIN_ID) == {2}
     texts = [r["text"] for e in fired for r in e.responses]
     assert any("1 ta" in (t or "") for t in texts)
 
@@ -313,7 +411,7 @@ async def test_gift_page_navigation_replaces_messages(repo):
         FakeStarGiftType(i, stars=100, availability_resale=1, title=f"Gift {i}")
         for i in range(1, 11)  # 10 gifts -> 2 pages at page size 8
     ]
-    bot_client, _ = await make_bot(repo, gift_types=gift_types)
+    bot_client, *_ = await make_bot(repo, gift_types=gift_types)
     page1_events = await bot_client.send("🎯 Offer boshlash", ADMIN_ID)
     page1_message_count = sum(len(e.responses) for e in page1_events)
 

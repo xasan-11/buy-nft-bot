@@ -4,7 +4,7 @@ from src.monitoring.offer_state import OfferState
 
 
 async def test_default_start_is_unbounded_and_stays_active(repo):
-    state = OfferState(repo)
+    state = OfferState(repo, 111)
     await state.load()
 
     await state.start()
@@ -17,7 +17,7 @@ async def test_default_start_is_unbounded_and_stays_active(repo):
 
 
 async def test_stop_ends_an_unbounded_run_immediately(repo):
-    state = OfferState(repo)
+    state = OfferState(repo, 111)
     await state.load()
     await state.start()
 
@@ -28,19 +28,19 @@ async def test_stop_ends_an_unbounded_run_immediately(repo):
 
 
 async def test_inactive_by_default(repo):
-    state = OfferState(repo)
+    state = OfferState(repo, 111)
     await state.load()
 
     assert state.is_active() is False
 
 
 async def test_state_survives_reload(repo):
-    state = OfferState(repo)
+    state = OfferState(repo, 111)
     await state.load()
     await state.start()
     await state.record_sent()
 
-    reloaded = OfferState(repo)
+    reloaded = OfferState(repo, 111)
     await reloaded.load()
 
     assert reloaded.is_active() is True
@@ -48,14 +48,14 @@ async def test_state_survives_reload(repo):
 
 
 async def test_not_paused_by_default(repo):
-    state = OfferState(repo)
+    state = OfferState(repo, 111)
     await state.load()
 
     assert state.is_paused() is False
 
 
 async def test_pause_sets_flag_and_returns_true_for_first_caller(repo):
-    state = OfferState(repo)
+    state = OfferState(repo, 111)
     await state.load()
     await state.start()
 
@@ -69,7 +69,7 @@ async def test_pause_is_idempotent_only_first_caller_gets_true(repo):
     """Guards the exact scenario several concurrently-scanned listings all
     hitting BALANCE_TOO_LOW at once — only one of them should ever think it
     needs to send the "paused" notification."""
-    state = OfferState(repo)
+    state = OfferState(repo, 111)
     await state.load()
     await state.start()
 
@@ -83,7 +83,7 @@ async def test_pause_is_idempotent_only_first_caller_gets_true(repo):
 
 
 async def test_resume_clears_flag_and_returns_true_for_first_caller(repo):
-    state = OfferState(repo)
+    state = OfferState(repo, 111)
     await state.load()
     await state.start()
     await state.pause()
@@ -95,7 +95,7 @@ async def test_resume_clears_flag_and_returns_true_for_first_caller(repo):
 
 
 async def test_resume_is_idempotent_only_first_caller_gets_true(repo):
-    state = OfferState(repo)
+    state = OfferState(repo, 111)
     await state.load()
     await state.start()
     await state.pause()
@@ -108,7 +108,7 @@ async def test_resume_is_idempotent_only_first_caller_gets_true(repo):
 
 
 async def test_resume_without_pause_is_a_noop(repo):
-    state = OfferState(repo)
+    state = OfferState(repo, 111)
     await state.load()
     await state.start()
 
@@ -119,7 +119,7 @@ async def test_resume_without_pause_is_a_noop(repo):
 
 
 async def test_starting_a_fresh_run_clears_a_stale_pause(repo):
-    state = OfferState(repo)
+    state = OfferState(repo, 111)
     await state.load()
     await state.start()
     await state.pause()
@@ -131,12 +131,12 @@ async def test_starting_a_fresh_run_clears_a_stale_pause(repo):
 
 
 async def test_pause_state_survives_reload(repo):
-    state = OfferState(repo)
+    state = OfferState(repo, 111)
     await state.load()
     await state.start()
     await state.pause()
 
-    reloaded = OfferState(repo)
+    reloaded = OfferState(repo, 111)
     await reloaded.load()
 
     assert reloaded.is_paused() is True

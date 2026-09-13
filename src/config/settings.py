@@ -37,8 +37,10 @@ class Settings:
     def load(cls) -> "Settings":
         api_id_raw = os.getenv("TELEGRAM_API_ID")
         api_hash = os.getenv("TELEGRAM_API_HASH")
-        # Optional: if unset, the control-bot login flow (login_flow.py)
-        # asks the owner for it via /login <phone> instead of assuming one.
+        # Optional, and only ever used as the owner's own phone number (see
+        # telegram/user_manager.py) — if unset, the control bot asks the
+        # owner for it via /login <phone> instead of assuming one. Every
+        # other user always supplies their own phone via /login.
         phone = os.getenv("TELEGRAM_PHONE") or None
         bot_token = os.getenv("CONTROL_BOT_TOKEN")
         owner_raw = os.getenv("OWNER_TELEGRAM_ID")

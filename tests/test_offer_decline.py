@@ -6,6 +6,8 @@ from telethon.tl import types
 from src.database.repository import OfferStatus
 from src.telegram.offer_decline import register_offer_decline_handlers
 
+USER_ID = 111
+
 
 class FakeStarGiftUnique:
     def __init__(self, slug):
@@ -77,11 +79,11 @@ def make_folder_remover(calls=None, result=True):
 
 async def test_ignores_unrelated_message_actions(repo):
     await repo.claim_offer_slot(
-        offer_id=1, slug="Gift-1", gift_id=1, price_stars=125, duration_seconds=21600,
+        USER_ID, offer_id=1, slug="Gift-1", gift_id=1, price_stars=125, duration_seconds=21600,
         expires_at="2999-01-01T00:00:00+00:00", owner_peer_id=42,
     )
     client = FakeClient()
-    register_offer_decline_handlers(client, repo)
+    register_offer_decline_handlers(client, repo, USER_ID)
 
     await client.dispatch_new_message(FakeEvent(FakeAction()))
 
@@ -91,14 +93,14 @@ async def test_ignores_unrelated_message_actions(repo):
 
 async def test_declined_action_updates_status_and_removes_from_folder_when_no_other_pending(repo):
     await repo.claim_offer_slot(
-        offer_id=1, slug="Gift-2", gift_id=1, price_stars=125, duration_seconds=21600,
+        USER_ID, offer_id=1, slug="Gift-2", gift_id=1, price_stars=125, duration_seconds=21600,
         expires_at="2999-01-01T00:00:00+00:00", owner_peer_id=42,
     )
     folder = object()
     remove_calls = []
     client = FakeClient()
     register_offer_decline_handlers(
-        client, repo,
+        client, repo, USER_ID,
         folder_finder=make_folder_finder(folder),
         folder_remover=make_folder_remover(remove_calls),
     )
@@ -115,13 +117,13 @@ async def test_declined_action_also_detected_via_message_edit(repo):
     the original offer message or a brand new one — both event types must
     be watched."""
     await repo.claim_offer_slot(
-        offer_id=1, slug="Gift-3", gift_id=1, price_stars=125, duration_seconds=21600,
+        USER_ID, offer_id=1, slug="Gift-3", gift_id=1, price_stars=125, duration_seconds=21600,
         expires_at="2999-01-01T00:00:00+00:00", owner_peer_id=42,
     )
     remove_calls = []
     client = FakeClient()
     register_offer_decline_handlers(
-        client, repo,
+        client, repo, USER_ID,
         folder_finder=make_folder_finder(object()),
         folder_remover=make_folder_remover(remove_calls),
     )
@@ -135,17 +137,17 @@ async def test_declined_action_also_detected_via_message_edit(repo):
 
 async def test_seller_kept_in_folder_while_another_offer_is_still_pending(repo):
     await repo.claim_offer_slot(
-        offer_id=1, slug="Gift-4a", gift_id=1, price_stars=125, duration_seconds=21600,
+        USER_ID, offer_id=1, slug="Gift-4a", gift_id=1, price_stars=125, duration_seconds=21600,
         expires_at="2999-01-01T00:00:00+00:00", owner_peer_id=77,
     )
     await repo.claim_offer_slot(
-        offer_id=2, slug="Gift-4b", gift_id=1, price_stars=125, duration_seconds=21600,
+        USER_ID, offer_id=2, slug="Gift-4b", gift_id=1, price_stars=125, duration_seconds=21600,
         expires_at="2999-01-01T00:00:00+00:00", owner_peer_id=77,  # same seller, still pending
     )
     remove_calls = []
     client = FakeClient()
     register_offer_decline_handlers(
-        client, repo,
+        client, repo, USER_ID,
         folder_finder=make_folder_finder(object()),
         folder_remover=make_folder_remover(remove_calls),
     )
@@ -160,17 +162,17 @@ async def test_seller_kept_in_folder_while_another_offer_is_still_pending(repo):
 
 async def test_seller_removed_once_their_last_pending_offer_also_resolves(repo):
     await repo.claim_offer_slot(
-        offer_id=1, slug="Gift-5a", gift_id=1, price_stars=125, duration_seconds=21600,
+        USER_ID, offer_id=1, slug="Gift-5a", gift_id=1, price_stars=125, duration_seconds=21600,
         expires_at="2999-01-01T00:00:00+00:00", owner_peer_id=77,
     )
     await repo.claim_offer_slot(
-        offer_id=2, slug="Gift-5b", gift_id=1, price_stars=125, duration_seconds=21600,
+        USER_ID, offer_id=2, slug="Gift-5b", gift_id=1, price_stars=125, duration_seconds=21600,
         expires_at="2999-01-01T00:00:00+00:00", owner_peer_id=77,
     )
     remove_calls = []
     client = FakeClient()
     register_offer_decline_handlers(
-        client, repo,
+        client, repo, USER_ID,
         folder_finder=make_folder_finder(object()),
         folder_remover=make_folder_remover(remove_calls),
     )
@@ -189,7 +191,7 @@ async def test_untracked_offer_updates_status_but_skips_folder_lookup_gracefully
     remove_calls = []
     client = FakeClient()
     register_offer_decline_handlers(
-        client, repo,
+        client, repo, USER_ID,
         folder_finder=make_folder_finder(object()),
         folder_remover=make_folder_remover(remove_calls),
     )
@@ -201,11 +203,11 @@ async def test_untracked_offer_updates_status_but_skips_folder_lookup_gracefully
 
 async def test_folder_not_found_does_not_crash(repo):
     await repo.claim_offer_slot(
-        offer_id=1, slug="Gift-6", gift_id=1, price_stars=125, duration_seconds=21600,
+        USER_ID, offer_id=1, slug="Gift-6", gift_id=1, price_stars=125, duration_seconds=21600,
         expires_at="2999-01-01T00:00:00+00:00", owner_peer_id=42,
     )
     client = FakeClient()
-    register_offer_decline_handlers(client, repo, folder_finder=make_folder_finder(None))
+    register_offer_decline_handlers(client, repo, USER_ID, folder_finder=make_folder_finder(None))
 
     await client.dispatch_new_message(FakeEvent(make_declined_action("Gift-6"), chat_id=42))
 
@@ -215,7 +217,7 @@ async def test_folder_not_found_does_not_crash(repo):
 
 async def test_folder_lookup_exception_does_not_crash(repo):
     await repo.claim_offer_slot(
-        offer_id=1, slug="Gift-7", gift_id=1, price_stars=125, duration_seconds=21600,
+        USER_ID, offer_id=1, slug="Gift-7", gift_id=1, price_stars=125, duration_seconds=21600,
         expires_at="2999-01-01T00:00:00+00:00", owner_peer_id=42,
     )
 
@@ -223,7 +225,7 @@ async def test_folder_lookup_exception_does_not_crash(repo):
         raise RuntimeError("boom")
 
     client = FakeClient()
-    register_offer_decline_handlers(client, repo, folder_finder=raising_finder)
+    register_offer_decline_handlers(client, repo, USER_ID, folder_finder=raising_finder)
 
     await client.dispatch_new_message(FakeEvent(make_declined_action("Gift-7"), chat_id=42))
 

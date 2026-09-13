@@ -21,7 +21,7 @@ def build_user_client(settings: Settings, session_string: str = "") -> TelegramC
     database, takes precedence over the TELEGRAM_SESSION_STRING env var
     from generate_session.py) and, if the client comes back unauthenticated
     after connecting, drives login through the control bot instead of
-    failing — see telegram/login_flow.py.
+    failing — see telegram/user_manager.py.
     """
     return TelegramClient(StringSession(session_string), settings.api_id, settings.api_hash)
 

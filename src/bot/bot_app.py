@@ -4,16 +4,53 @@ import logging
 import re
 
 from telethon import Button, events
-from telethon.tl import functions
+from telethon.tl import functions, types
 
 from ..database.repository import ALLOWED_OFFER_HOURS, Repository
+from ..marketplace.balance import get_stars_balance
+from ..marketplace.paid_reaction import send_all_stars_as_reaction
+from ..marketplace.post_link import parse_post_link
 from ..monitoring.channel_monitor import ChannelMonitor, MonitorState
-from ..monitoring.offer_state import OfferState
+from ..monitoring.offer_registry import OfferRegistry
 from ..notifications.notifier import Notifier
 from . import gift_picker, keyboard, menu
 from .authorization import UNAUTHORIZED_MESSAGE
 
 logger = logging.getLogger("bot")
+
+
+async def resolve_owner_target_client(repo: Repository, session_manager, telegram_id: int):
+    """Shared by the owner-only "⭐ Stars" (balance check) and "⭐ Take
+    stars" (paid-reaction) flows: resolves the already-connected
+    TelegramClient for one Telegram user who has completed /login through
+    this same bot, keyed purely by their numeric Telegram ID.
+
+    There is no other way to reach any account here, by design (see
+    telegram/user_manager.py) — only a client this bot itself authorized
+    via /login ever exists in session_manager, so this can never touch an
+    unrelated/foreign account, and every balance-read/reaction-send below
+    only ever acts through that account's own authorization, exactly as
+    Telegram itself requires.
+
+    Returns (client, None) on success, or (None, error_message) — the
+    error message is exactly what should be shown to the owner.
+    """
+    stored_session = await repo.get_user_session(telegram_id)
+    if not stored_session:
+        return None, "❌ Bu ID bilan hech qanday akkount botga ulanmagan."
+    client = session_manager.get_client(telegram_id)
+    if client is None or not session_manager.is_ready(telegram_id):
+        return None, (
+            "⚠️ Bu akkount hozircha faol emas (ulanish jarayonida yoki sessiya "
+            "yaroqsiz). Birozdan so'ng qayta urinib ko'ring."
+        )
+    return client, None
+
+
+def _post_link_text(ref) -> str:
+    if ref.channel_username:
+        return f"https://t.me/{ref.channel_username}/{ref.message_id}"
+    return f"https://t.me/c/{ref.channel_id}/{ref.message_id}"
 
 
 def parse_positive_int(raw) -> "int | None":
@@ -67,8 +104,12 @@ def parse_user_id(raw) -> "int | None":
 PARAMETERIZED_ACTIONS = {
     "add", "remove", "setmaxprice", "setofferprice", "setofferlevel",
     "setoffernftcount", "setofferexpiry", "addadmin", "removeadmin",
-    "startpo",
+    "startpo", "login", "stars_balance", "take_stars",
 }
+# "take_stars_link" is intentionally not here — it's only ever entered by
+# do_take_stars_account_id chaining into it after a valid account ID, never
+# directly from a button tap (see PARAMETERIZED_ACTIONS' consumer,
+# _button_tap, further down).
 # "start_offer" is intentionally not here — it now opens the inline
 # gift-type picker (see gift_picker.py) instead of prompting for a plain
 # text value, so it's driven entirely by CallbackQuery handlers below.
@@ -81,11 +122,18 @@ def register_bot_handlers(
     state: MonitorState,
     notifier: Notifier,
     market_state: MonitorState,
-    offer_state: OfferState,
+    offer_registry: OfferRegistry,
+    session_manager,
 ) -> None:
-    """Registers every admin command on the control bot. Every handler
-    checks authorization by numeric Telegram user ID against the admins
-    table before doing anything else — usernames are never trusted.
+    """Registers every command on the control bot — multi-tenant: the
+    OWNER alone can reach channel/market monitoring, channel-list
+    management and admin management (/addadmin, /removeadmin, /admins),
+    exactly as before. Every other Telegram user (admins included — being
+    listed as an admin grants nothing extra here) can only connect their
+    own account (/login) and run their own independent offer-tashlash
+    pipeline (gift-type picker, start/stop, /setofferprice & friends) —
+    see keyboard.OWNER_ONLY_ACTIONS / keyboard.OFFER_ACTIONS for the exact
+    split, which this module enforces command-by-command below.
 
     Each command's actual behavior lives in one do_<action> function below,
     called both by the plain-text /command regex handler (which already has
@@ -93,6 +141,12 @@ def register_bot_handlers(
     reply-keyboard flow (button tap -> prompt -> value reply) further down.
     Tapping a button never re-implements a command, it only drives the same
     function through a friendlier two-step conversation.
+
+    `offer_registry` and `session_manager` are the multi-tenant primitives
+    (see monitoring/offer_registry.py and telegram/user_manager.py): every
+    offer-tashlash action below is scoped to event.sender_id through them,
+    so one user's login/session/offer settings/run state never touches
+    another's.
     """
 
     # sender_id -> action key awaiting a follow-up value message, set only
@@ -104,14 +158,13 @@ def register_bot_handlers(
     # sender_id -> in-progress gift-type picker state ("🎯 Offer boshlash"),
     # keyed the same way — see start_gift_picker/render_gift_page below.
     # Ephemeral/in-memory like pending_action: a restart mid-pick just means
-    # the admin taps the button again.
+    # the user taps the button again.
     gift_sessions: dict = {}
 
-    async def require_admin(event) -> bool:
-        if await repo.is_admin(event.sender_id):
-            return True
-        await event.respond(UNAUTHORIZED_MESSAGE)
-        return False
+    # sender_id -> {"telegram_id": <account id>} while the owner is
+    # mid-flow on "⭐ Take stars" (account ID prompted, waiting for the
+    # post link next) — see do_take_stars_account_id/do_take_stars_link.
+    take_stars_sessions: dict = {}
 
     async def require_owner(event) -> bool:
         if await repo.is_owner(event.sender_id):
@@ -134,7 +187,7 @@ def register_bot_handlers(
         added = await repo.add_admin(user_id, event.sender_id)
         if added:
             await event.respond(f"✅ Added {user_id} as administrator.")
-            await menu.sync_admin_menu(bot_client, user_id)
+            await menu.sync_user_menu(bot_client, user_id)
         else:
             await event.respond(f"ℹ️ {user_id} is already an administrator.")
 
@@ -152,17 +205,17 @@ def register_bot_handlers(
             await event.respond(f"ℹ️ {user_id} is not an administrator.")
         else:
             await event.respond(f"✅ Removed {user_id} from administrators.")
-            await menu.reset_admin_menu(bot_client, user_id)
+            await menu.reset_owner_menu(bot_client, user_id)
 
     async def do_admins(event) -> None:
-        if not await require_admin(event):
+        if not await require_owner(event):
             return
         rows = await repo.list_admins()
         lines = [f"{'👑' if r['is_owner'] else '🛡'} {r['user_id']}" for r in rows]
         await event.respond("Administrators:\n" + "\n".join(lines))
 
     async def do_add_channel(event, raw) -> "bool | None":
-        if not await require_admin(event):
+        if not await require_owner(event):
             return
         username = parse_channel_username(raw)
         if username is None:
@@ -181,7 +234,7 @@ def register_bot_handlers(
             await event.respond(f"ℹ️ @{username} is already monitored.")
 
     async def do_remove_channel(event, raw) -> "bool | None":
-        if not await require_admin(event):
+        if not await require_owner(event):
             return
         username = parse_channel_username(raw)
         if username is None:
@@ -200,7 +253,7 @@ def register_bot_handlers(
             await event.respond(f"ℹ️ @{username} was not monitored.")
 
     async def do_list(event) -> None:
-        if not await require_admin(event):
+        if not await require_owner(event):
             return
         rows = await repo.list_channels()
         if not rows:
@@ -210,14 +263,14 @@ def register_bot_handlers(
         await event.respond("Monitored channels:\n" + "\n".join(lines))
 
     async def do_stop(event) -> None:
-        if not await require_admin(event):
+        if not await require_owner(event):
             return
         await state.stop()
         await event.respond("🛑 NFT monitoring and automatic purchasing stopped.")
         await notifier.notify_monitoring_stopped()
 
     async def do_sstart(event) -> None:
-        if not await require_admin(event):
+        if not await require_owner(event):
             return
         await state.start()
         await monitor.refresh_channels()
@@ -225,21 +278,21 @@ def register_bot_handlers(
         await notifier.notify_monitoring_started()
 
     async def do_startg(event) -> None:
-        if not await require_admin(event):
+        if not await require_owner(event):
             return
         await market_state.start()
         await event.respond("🟢 Market (resale gift) monitoring and automatic purchasing started.")
         await notifier.notify_market_monitoring_started()
 
     async def do_stopg(event) -> None:
-        if not await require_admin(event):
+        if not await require_owner(event):
             return
         await market_state.stop()
         await event.respond("🛑 Market (resale gift) monitoring and automatic purchasing stopped.")
         await notifier.notify_market_monitoring_stopped()
 
     async def do_startpo(event, raw) -> "bool | None":
-        if not await require_admin(event):
+        if not await require_owner(event):
             return
         seconds = parse_nonnegative_int(raw)
         if seconds is None:
@@ -260,7 +313,7 @@ def register_bot_handlers(
             )
 
     async def do_stopo(event) -> None:
-        if not await require_admin(event):
+        if not await require_owner(event):
             return
         await repo.set_verbose_poll_log(False)
         await event.respond(
@@ -268,7 +321,7 @@ def register_bot_handlers(
         )
 
     async def do_setmaxprice(event, raw) -> "bool | None":
-        if not await require_admin(event):
+        if not await require_owner(event):
             return
         value = parse_positive_int(raw)
         if value is None:
@@ -280,41 +333,148 @@ def register_bot_handlers(
             f"✅ Maximum NFT price set to {value} ⭐. Applies to both channel and market monitoring."
         )
 
-    async def do_setofferlevel(event, raw) -> "bool | None":
-        if not await require_admin(event):
+    # ------------------------------------------- Stars balance / paid reactions
+    # (owner only — see keyboard.OWNER_ONLY_ACTIONS; each acts strictly
+    # through the target account's own /login-authorized session, via
+    # resolve_owner_target_client above)
+
+    async def do_stars_balance(event, raw) -> "bool | None":
+        if not await require_owner(event):
             return
+        account_id = parse_user_id(raw)
+        if account_id is None:
+            await event.respond("⚠️ Akkount ID raqam bo'lishi kerak.")
+            return False
+        client, error = await resolve_owner_target_client(repo, session_manager, account_id)
+        if error:
+            await event.respond(error)
+            return
+        balance = await get_stars_balance(client)
+        if balance is None:
+            await event.respond(
+                f"❌ [{account_id}] akkountining Stars balansini olishda xatolik yuz berdi."
+            )
+            return
+        await event.respond(f"⭐ Akkount {account_id}: joriy balans — {balance} Stars")
+
+    async def _take_stars_and_report(event, account_id: int, ref) -> None:
+        client, error = await resolve_owner_target_client(repo, session_manager, account_id)
+        if error:
+            await event.respond(error)
+            return
+
+        try:
+            if ref.channel_username:
+                entity = await client.get_entity(ref.channel_username)
+            else:
+                entity = await client.get_entity(types.PeerChannel(ref.channel_id))
+        except Exception as e:
+            await event.respond(f"❌ Postni/kanalni topib bo'lmadi: {e}")
+            return
+
+        balance = await get_stars_balance(client)
+        if balance is None:
+            await event.respond(
+                f"❌ [{account_id}] akkountining Stars balansini olishda xatolik yuz berdi."
+            )
+            return
+        if balance <= 0:
+            await event.respond(f"❌ [{account_id}] akkountida Stars balansi 0, reaksiya yuborib bo'lmaydi.")
+            return
+
+        outcome = await send_all_stars_as_reaction(client, entity, ref.message_id, balance)
+
+        if outcome.sent > 0:
+            await event.respond(
+                f"⭐ {outcome.sent} Stars reaksiya yuborildi postga {_post_link_text(ref)}, "
+                f"akkount {account_id} orqali. Qolgan balans: {outcome.remaining_balance}."
+            )
+        if outcome.error:
+            await event.respond(f"❌ Xatolik: {outcome.error}")
+
+    async def do_take_stars_account_id(event, raw) -> "bool | None":
+        if not await require_owner(event):
+            return
+        account_id = parse_user_id(raw)
+        if account_id is None:
+            await event.respond("⚠️ Akkount ID raqam bo'lishi kerak.")
+            return False
+        client, error = await resolve_owner_target_client(repo, session_manager, account_id)
+        if error:
+            await event.respond(error)
+            return False
+
+        take_stars_sessions[event.sender_id] = {"telegram_id": account_id}
+        pending_action[event.sender_id] = "take_stars_link"
+        await event.respond(
+            "🔗 Qaysi postga reaksiya yubormoqchisiz? Havolani yuboring "
+            "(masalan https://t.me/kanal/123)."
+        )
+        return False  # keep pending_action as "take_stars_link", set just above
+
+    async def do_take_stars_link(event, raw) -> "bool | None":
+        if not await require_owner(event):
+            return
+        session = take_stars_sessions.get(event.sender_id)
+        if session is None:
+            await event.respond("⚠️ Sessiya topilmadi, qaytadan '⭐ Take stars' tugmasini bosing.")
+            return
+
+        ref = parse_post_link(raw)
+        if ref is None:
+            await event.respond("⚠️ Post havolasini to'g'ri kiriting, masalan https://t.me/kanal/123")
+            return False  # re-prompt for a valid link — the account ID is already known
+
+        take_stars_sessions.pop(event.sender_id, None)
+        await _take_stars_and_report(event, session["telegram_id"], ref)
+
+    async def do_take_stars_direct(event, account_id_raw, link_raw) -> "bool | None":
+        """Single-shot /takestars <id> <link> — same logic as the button
+        flow above, just gathering both values from one command instead of
+        two prompts."""
+        if not await require_owner(event):
+            return
+        account_id = parse_user_id(account_id_raw)
+        if account_id is None:
+            await event.respond("⚠️ Usage: /takestars <account_id> <post_link>")
+            return
+        ref = parse_post_link(link_raw)
+        if ref is None:
+            await event.respond("⚠️ Post havolasini to'g'ri kiriting, masalan https://t.me/kanal/123")
+            return
+        await _take_stars_and_report(event, account_id, ref)
+
+    # --------------------------------------------- per-user offer settings
+    # (available to ANY user — no ownership/admin check at all, scoped to
+    # event.sender_id via the per-user repository methods)
+
+    async def do_setofferlevel(event, raw) -> "bool | None":
         value = parse_nonnegative_int(raw)
         if value is None:
             await event.respond("⚠️ Usage: /setofferlevel <0 yoki musbat son>, masalan /setofferlevel 1")
             return False
-        await repo.set_offer_level(value)
+        await repo.set_user_offer_level(event.sender_id, value)
         await event.respond(f"✅ Offer uchun sotuvchi darajasi shartini {value} ga o'rnatdim.")
 
     async def do_setoffernftcount(event, raw) -> "bool | None":
-        if not await require_admin(event):
-            return
         value = parse_positive_int(raw)
         if value is None:
             await event.respond("⚠️ Usage: /setoffernftcount <musbat son>, masalan /setoffernftcount 3")
             return False
-        await repo.set_offer_nft_count(value)
+        await repo.set_user_offer_nft_count(event.sender_id, value)
         await event.respond(
             f"✅ Offer faqat {value} tadan kam NFT/gift egasi bo'lgan sotuvchilarga tashlanadi."
         )
 
     async def do_setofferprice(event, raw) -> "bool | None":
-        if not await require_admin(event):
-            return
         value = parse_positive_int(raw)
         if value is None:
             await event.respond("⚠️ Usage: /setofferprice <musbat Stars soni>, masalan /setofferprice 125")
             return False
-        await repo.set_offer_price(value)
+        await repo.set_user_offer_price(event.sender_id, value)
         await event.respond(f"✅ Offer narxi {value} ⭐ ga o'rnatildi.")
 
     async def do_setofferexpiry(event, raw) -> "bool | None":
-        if not await require_admin(event):
-            return
         value = parse_offer_hours(raw)
         if value is None:
             allowed = ", ".join(str(h) for h in ALLOWED_OFFER_HOURS)
@@ -323,8 +483,11 @@ def register_bot_handlers(
                 "Masalan: /setofferexpiry 6"
             )
             return False
-        await repo.set_offer_expiry_hours(value)
+        await repo.set_user_offer_expiry_hours(event.sender_id, value)
         await event.respond(f"✅ Offer amal qilish muddati {value} soatga o'rnatildi.")
+
+    async def do_login(event, raw) -> "bool | None":
+        await session_manager.handle_login_command(event.sender_id, raw, event)
 
     def build_gift_keyboard(session):
         """One row per gift type on the current page — a plain text toggle
@@ -358,7 +521,7 @@ def register_bot_handlers(
         return rows, pages
 
     async def render_gift_page(event, sender_id) -> None:
-        """(Re)draws the current page of the gift-type picker for one admin
+        """(Re)draws the current page of the gift-type picker for one user
         as a single plain-text message with an inline keyboard — no photos
         or documents are sent (that was hitting DocumentInvalidError). Any
         message from a previously rendered page for this same sender is
@@ -379,8 +542,12 @@ def register_bot_handlers(
         session["message_ids"] = [msg.id]
 
     async def start_gift_picker(event) -> None:
-        if not await require_admin(event):
+        if not session_manager.is_ready(event.sender_id):
+            await event.respond(
+                "⚠️ Avval o'z Telegram akkountingizni ulang: /login +998901234567"
+            )
             return
+        client = session_manager.get_client(event.sender_id)
 
         stale = gift_sessions.pop(event.sender_id, None)
         if stale and stale["message_ids"]:
@@ -390,7 +557,7 @@ def register_bot_handlers(
                 logger.exception("Failed to clear stale gift-picker session for %s", event.sender_id)
 
         try:
-            result = await monitor.user_client(functions.payments.GetStarGiftsRequest(hash=0))
+            result = await client(functions.payments.GetStarGiftsRequest(hash=0))
         except Exception:
             logger.exception("Failed to fetch gift types for the offer picker")
             await event.respond("❌ Gift turlarini olishda xatolik yuz berdi. Birozdan so'ng qayta urinib ko'ring.")
@@ -401,7 +568,7 @@ def register_bot_handlers(
             await event.respond("ℹ️ Hozircha resale uchun mavjud gift turi topilmadi.")
             return
 
-        already_selected = await repo.get_offer_selected_gift_types()
+        already_selected = await repo.get_user_offer_selected_gift_types(event.sender_id)
         available_ids = {o.id for o in options}
         gift_sessions[event.sender_id] = {
             "options": options,
@@ -412,35 +579,35 @@ def register_bot_handlers(
         await render_gift_page(event, event.sender_id)
 
     async def do_stop_offer(event) -> None:
-        if not await require_admin(event):
-            return
+        offer_state = await offer_registry.get(event.sender_id)
         sent = offer_state.sent
         await offer_state.stop()
         await event.respond(f"🛑 Offer tashlash to'xtatildi. Jami {sent} ta offer tashlandi.")
 
     async def do_status(event) -> None:
-        if not await require_admin(event):
+        if not await require_owner(event):
             return
         stats = await repo.get_stats()
         offer_stats = await repo.get_offer_stats()
         max_price = await repo.get_max_price()
         channel_running = "RUNNING" if state.is_running() else "STOPPED"
         market_running = "RUNNING" if market_state.is_running() else "STOPPED"
-        offer_level = await repo.get_offer_level()
-        offer_nft_count = await repo.get_offer_nft_count()
-        offer_price = await repo.get_offer_price()
-        offer_expiry_hours = await repo.get_offer_expiry_hours()
-        selected_gift_types = await repo.get_offer_selected_gift_types()
+        offer_state = await offer_registry.get(event.sender_id)
+        offer_level = await repo.get_user_offer_level(event.sender_id)
+        offer_nft_count = await repo.get_user_offer_nft_count(event.sender_id)
+        offer_price = await repo.get_user_offer_price(event.sender_id)
+        offer_expiry_hours = await repo.get_user_offer_expiry_hours(event.sender_id)
+        selected_gift_types = await repo.get_user_offer_selected_gift_types(event.sender_id)
         if not offer_state.is_active():
-            offer_run_line = "Offer run: STOPPED"
+            offer_run_line = "Offer run (siz): STOPPED"
         elif offer_state.is_paused():
             offer_run_line = (
-                f"Offer run: PAUSED ⏸ (balans yetarli emas — {offer_state.sent} ta yuborilgan edi, "
+                f"Offer run (siz): PAUSED ⏸ (balans yetarli emas — {offer_state.sent} ta yuborilgan edi, "
                 f"{len(selected_gift_types)} ta gift turi tanlangan)"
             )
         else:
             offer_run_line = (
-                f"Offer run: ACTIVE ({offer_state.sent} ta yuborildi, "
+                f"Offer run (siz): ACTIVE ({offer_state.sent} ta yuborildi, "
                 f"{len(selected_gift_types)} ta gift turi tanlangan)"
             )
         verbose_on = await repo.get_verbose_poll_log()
@@ -467,13 +634,13 @@ def register_bot_handlers(
             f"Successful purchases: {stats['success']}\n"
             f"Failed purchases: {stats['failed']}\n"
             "\n"
-            "🎯 Offer sozlamalari\n"
+            "🎯 Offer sozlamalari (siz)\n"
             f"Sotuvchi darajasi (=): {offer_level}\n"
             f"Sotuvchi NFT soni (<): {offer_nft_count}\n"
             f"Offer narxi: {offer_price} ⭐\n"
             f"Offer muddati: {offer_expiry_hours} soat\n"
             f"{offer_run_line}\n"
-            f"Offerlar: {offer_stats['total']} jami "
+            f"Offerlar (barcha foydalanuvchilar): {offer_stats['total']} jami "
             f"(pending: {offer_stats['pending']}, accepted: {offer_stats['accepted']}, "
             f"declined: {offer_stats['declined']}, expired: {offer_stats['expired']}, "
             f"failed: {offer_stats['failed']})"
@@ -483,19 +650,29 @@ def register_bot_handlers(
 
     @bot_client.on(events.NewMessage(pattern=r"^/start$"))
     async def _start(event):
-        if await repo.is_admin(event.sender_id):
+        if await repo.is_owner(event.sender_id):
             await event.respond(
                 "🤖 NFT monitoring control bot.\n"
                 "Use /status for current state, /sstart to start channel monitoring, "
                 "/stop to stop it, /startg and /stopg for market monitoring.",
-                buttons=keyboard.admin_keyboard(),
+                buttons=keyboard.owner_keyboard(),
             )
             # By now the bot definitely has this user's entity cached (they
-            # just messaged it), so this is the one place the full admin
+            # just messaged it), so this is the one place the full owner
             # menu is guaranteed to apply successfully.
-            await menu.sync_admin_menu(bot_client, event.sender_id)
+            await menu.sync_owner_menu(bot_client, event.sender_id)
         else:
-            await event.respond(UNAUTHORIZED_MESSAGE, buttons=Button.clear())
+            await repo.ensure_user(event.sender_id)
+            await event.respond(
+                "🤖 Salom! Bu yerda siz o'z shaxsiy Telegram akkountingizni ulab, "
+                "sotuvchilarga avtomatik ravishda offer (taklif) tashlash funksiyasidan "
+                "foydalanishingiz mumkin.\n\n"
+                "1️⃣ Avval akkountingizni ulang: /login +998901234567\n"
+                "2️⃣ Offer sozlamalaringizni belgilang (narx, daraja, NFT soni, muddat)\n"
+                "3️⃣ \"🎯 Offer boshlash\" tugmasi orqali gift turlarini tanlab boshlang",
+                buttons=keyboard.user_keyboard(),
+            )
+            await menu.sync_user_menu(bot_client, event.sender_id)
 
     @bot_client.on(events.NewMessage(pattern=r"^/addadmin\s+(\d+)$"))
     async def _addadmin(event):
@@ -549,6 +726,10 @@ def register_bot_handlers(
     async def _setmaxprice(event):
         await do_setmaxprice(event, event.pattern_match.group(1))
 
+    @bot_client.on(events.NewMessage(pattern=r"^/login(?:\s+(\S+))?$"))
+    async def _login(event):
+        await do_login(event, event.pattern_match.group(1))
+
     @bot_client.on(events.NewMessage(pattern=r"^/setofferlevel(?:\s+(\S+))?$"))
     async def _setofferlevel(event):
         await do_setofferlevel(event, event.pattern_match.group(1))
@@ -568,6 +749,20 @@ def register_bot_handlers(
     @bot_client.on(events.NewMessage(pattern=r"^/status$"))
     async def _status(event):
         await do_status(event)
+
+    @bot_client.on(events.NewMessage(pattern=r"^/stars(?:\s+(\S+))?$"))
+    async def _stars(event):
+        await do_stars_balance(event, event.pattern_match.group(1))
+
+    @bot_client.on(events.NewMessage(pattern=r"^/takestars(?:\s+(\S+)\s+(\S+))?$"))
+    async def _takestars(event):
+        match = event.pattern_match
+        if match.group(1) is None:
+            if not await require_owner(event):
+                return
+            await event.respond("⚠️ Usage: /takestars <account_id> <post_link>")
+            return
+        await do_take_stars_direct(event, match.group(1), match.group(2))
 
     # ------------------------------------------------- persistent-keyboard flow
 
@@ -594,6 +789,7 @@ def register_bot_handlers(
         "add": "➕ Qo'shmoqchi bo'lgan kanal username'ini kiriting (masalan @kanal):",
         "remove": "➖ O'chirmoqchi bo'lgan kanal username'ini kiriting:",
         "setmaxprice": "💰 Yangi maksimal narxni kiriting (Stars, musbat son):",
+        "login": "🔑 Telefon raqamingizni yuboring, masalan: +998901234567",
         "setofferprice": "💸 Yangi offer narxini kiriting (Stars, musbat son):",
         "setofferlevel": "🏷 Offer uchun talab qilinadigan sotuvchi darajasini kiriting (0 yoki musbat son):",
         "setoffernftcount": "🔢 Sotuvchida bo'lishi kerak bo'lgan maksimal NFT sonini kiriting (musbat son):",
@@ -603,12 +799,15 @@ def register_bot_handlers(
         "addadmin": "👤➕ Admin qilib qo'shmoqchi bo'lgan foydalanuvchining raqamli Telegram ID'sini kiriting:",
         "removeadmin": "👤➖ Administratorlikdan olib tashlamoqchi bo'lgan foydalanuvchining ID'sini kiriting:",
         "startpo": "🔍 Necha soniyalik oraliqda kuzatuv xabarlari yuborilsin? (0 = darhol xabar):",
+        "stars_balance": "🔍 Qaysi akkount ID'sini tekshirmoqchisiz?",
+        "take_stars": "🎯 Qaysi akkount ID orqali reaksiya yubormoqchisiz?",
     }
 
     parameterized_handlers = {
         "add": do_add_channel,
         "remove": do_remove_channel,
         "setmaxprice": do_setmaxprice,
+        "login": do_login,
         "setofferprice": do_setofferprice,
         "setofferlevel": do_setofferlevel,
         "setoffernftcount": do_setoffernftcount,
@@ -616,6 +815,9 @@ def register_bot_handlers(
         "addadmin": do_addadmin,
         "removeadmin": do_removeadmin,
         "startpo": do_startpo,
+        "stars_balance": do_stars_balance,
+        "take_stars": do_take_stars_account_id,
+        "take_stars_link": do_take_stars_link,
     }
 
     button_pattern = "^(" + "|".join(re.escape(label) for label in keyboard.BUTTON_ACTIONS) + ")$"
@@ -627,12 +829,12 @@ def register_bot_handlers(
         if action in keyboard.OWNER_ONLY_ACTIONS:
             if not await require_owner(event):
                 return
-        else:
-            if not await require_admin(event):
-                return
+        # Everything else (keyboard.OFFER_ACTIONS) is available to any
+        # user — no ownership/admin check at all, only scoped by
+        # event.sender_id inside each do_ function above.
 
         # A fresh button tap always supersedes any half-finished flow this
-        # same admin left hanging (e.g. tapped "💰 Max narx" then changed
+        # same user left hanging (e.g. tapped "💰 Max narx" then changed
         # their mind and tapped something else instead of replying).
         pending_action.pop(event.sender_id, None)
 
@@ -707,7 +909,8 @@ def register_bot_handlers(
             return
 
         selected = session["selected"]
-        await repo.set_offer_selected_gift_types(selected)
+        await repo.set_user_offer_selected_gift_types(event.sender_id, selected)
+        offer_state = await offer_registry.get(event.sender_id)
         await offer_state.start()
 
         try:

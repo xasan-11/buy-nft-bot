@@ -5,17 +5,16 @@ import logging
 import signal
 
 from .bot.bot_app import register_bot_handlers
-from .bot.menu import set_default_commands, sync_all_admin_menus
+from .bot.menu import set_default_commands, sync_all_menus
 from .config.settings import Settings
 from .database.repository import MARKET_MONITORING_KEY, Repository
 from .monitoring.channel_monitor import ChannelMonitor, MonitorState
 from .monitoring.market_monitor import MarketMonitor
-from .monitoring.offer_state import OfferState
+from .monitoring.offer_registry import OfferRegistry
 from .notifications.notifier import Notifier
 from .telegram.client import build_bot_client, build_user_client
-from .telegram.login_flow import SESSION_STRING_SETTING_KEY, UserLoginCoordinator
-from .telegram.offer_decline import register_offer_decline_handlers
 from .telegram.updates import register_handlers
+from .telegram.user_manager import UserSessionManager
 
 logging.basicConfig(
     level=logging.INFO,
@@ -30,28 +29,34 @@ async def run() -> None:
     repo = Repository(settings.db_path)
     await repo.connect(settings.owner_id, settings.max_nft_price, settings.market_poll_concurrency)
 
-    # The control bot is started first and independently of the user
-    # account: admin commands (/status, /add, etc.) work immediately even
-    # while the user account still needs to complete /login below.
+    # The control bot is started first and independently of every user
+    # account: owner commands (/status, /add, etc.) work immediately even
+    # while the owner's own account still needs to complete /login below,
+    # and any other user can /login and start offer-tashlash without ever
+    # touching the owner's account at all.
     bot_client = build_bot_client(settings)
     await bot_client.start(bot_token=settings.bot_token)
     logger.info("Control bot connected.")
 
     await set_default_commands(bot_client)
-    await sync_all_admin_menus(bot_client, repo)
+    await sync_all_menus(bot_client, repo)
 
     notifier = Notifier(bot_client, repo)
 
-    # A session saved by a previous /login (see login_flow.py) always wins
-    # over TELEGRAM_SESSION_STRING from generate_session.py — it's the most
-    # recently proven-valid one. Either may be empty/stale; either way
-    # UserLoginCoordinator.start() below checks is_user_authorized() itself
-    # and falls back to the bot-mediated login flow rather than failing.
-    stored_session = await repo.get_setting(SESSION_STRING_SETTING_KEY, "")
-    user_client = build_user_client(settings, stored_session or settings.session_string)
+    session_manager = UserSessionManager(bot_client, repo, settings)
+    session_manager.register_handlers()
 
-    login_coordinator = UserLoginCoordinator(user_client, bot_client, repo, settings)
-    login_coordinator.register_handlers()
+    # The owner's client is special only in that it's created and connected
+    # eagerly, right here, so it can be handed to ChannelMonitor/
+    # MarketMonitor immediately below — exactly like the single-tenant app
+    # did. A session saved by a previous /login always wins over
+    # TELEGRAM_SESSION_STRING from generate_session.py (it's the most
+    # recently proven-valid one); either may be empty/stale, and either way
+    # session_manager.restore_all() below checks is_user_authorized() itself
+    # and falls back to the bot-mediated login flow rather than failing.
+    owner_session = await repo.get_user_session(settings.owner_id)
+    user_client = build_user_client(settings, owner_session or settings.session_string)
+    session_manager.clients[settings.owner_id] = user_client
 
     state = MonitorState(repo)
     await state.load()
@@ -60,36 +65,56 @@ async def run() -> None:
 
     market_state = MonitorState(repo, key=MARKET_MONITORING_KEY)
     await market_state.load()
-    offer_state = OfferState(repo)
-    await offer_state.load()
+
+    # Multi-tenant auto-offer pipeline: listing *scanning* stays on the
+    # owner's account (one shared API-request stream — see
+    # monitoring/market_monitor.py's module docstring), but every
+    # currently-active user is independently evaluated and offered to
+    # through their own account — see offer_registry.py/user_manager.py.
+    offer_registry = OfferRegistry(repo)
+    await offer_registry.preload_active()
     market_monitor = MarketMonitor(
         user_client,
         repo,
         market_state,
         notifier,
         poll_interval=settings.market_poll_interval_seconds,
-        offer_state=offer_state,
+        offer_registry=offer_registry,
+        session_manager=session_manager,
     )
 
-    register_bot_handlers(bot_client, repo, monitor, state, notifier, market_state, offer_state)
-    register_offer_decline_handlers(user_client, repo)
+    register_bot_handlers(
+        bot_client, repo, monitor, state, notifier, market_state, offer_registry, session_manager
+    )
 
     logger.info(
         "Bootstrapped. Channel monitoring: %s, market monitoring: %s, channels: %d "
-        "(user account monitoring/purchasing waits for login).",
+        "(user accounts wait for their own /login before monitoring/purchasing/offers).",
         "RUNNING" if state.is_running() else "STOPPED",
         "RUNNING" if market_state.is_running() else "STOPPED",
         len(monitor.channel_ids),
     )
 
+    async def bootstrap_sessions() -> None:
+        """Reconnects every user (owner included) who already completed
+        /login in a previous run, then — if the owner still isn't
+        authorized — either auto-kicks off the phone/code flow (when
+        TELEGRAM_PHONE is configured) or asks them to /login manually.
+        Every other user simply stays unauthorized until they /login
+        themselves — nothing here waits on or blocks for them."""
+        await session_manager.restore_all()
+        if not session_manager.is_ready(settings.owner_id):
+            await session_manager.handle_login_command(settings.owner_id, settings.phone, None)
+
     async def user_dependent_services() -> None:
-        """Everything that actually touches the user account. Waits for
-        login_coordinator.ready so a fresh deploy with no valid session yet
-        never starts monitoring/purchasing/offers before /login finishes —
-        the control bot itself (started above) is unaffected and keeps
-        answering admin commands the whole time."""
-        await login_coordinator.ready.wait()
-        logger.info("User account authorized — starting monitoring.")
+        """Everything that actually touches the owner's account. Waits for
+        the owner's client to be authorized so a fresh deploy with no valid
+        session yet never starts channel/market monitoring before /login
+        finishes — the control bot itself (started above), and every other
+        user's own offer pipeline, are unaffected and keep working the
+        whole time."""
+        await session_manager.wait_ready(settings.owner_id)
+        logger.info("Owner account authorized — starting channel/market monitoring.")
         await monitor.refresh_channels()
         await asyncio.gather(
             user_client.run_until_disconnected(),
@@ -132,13 +157,13 @@ async def run() -> None:
             # that *does* let this coroutine unwind normally.
             logger.debug("Could not register a handler for signal %s here", sig)
 
-    # login_coordinator.start() deliberately finishes quickly (it kicks off
-    # the flow and returns — it does not wait for /code / /password), so it
-    # must NOT sit in the FIRST_COMPLETED set below: that set's purpose is
-    # "a long-running task died, time to shut down", and this task finishing
-    # on schedule is not that. It's still tracked so shutdown can cancel and
-    # await it like everything else.
-    login_task = asyncio.create_task(login_coordinator.start())
+    # bootstrap_sessions() deliberately finishes quickly for most users (it
+    # kicks off whatever flow applies and returns — it does not wait for
+    # /code / /password), so it must NOT sit in the FIRST_COMPLETED set
+    # below: that set's purpose is "a long-running task died, time to shut
+    # down", and this task finishing on schedule is not that. It's still
+    # tracked so shutdown can cancel and await it like everything else.
+    bootstrap_task = asyncio.create_task(bootstrap_sessions())
 
     background_tasks = [
         asyncio.create_task(bot_client.run_until_disconnected()),
@@ -151,17 +176,29 @@ async def run() -> None:
         await asyncio.wait([stop_waiter, *background_tasks], return_when=asyncio.FIRST_COMPLETED)
     finally:
         stop_waiter.cancel()
-        login_task.cancel()
+        bootstrap_task.cancel()
         for task in background_tasks:
             task.cancel()
-        await asyncio.gather(*background_tasks, login_task, stop_waiter, return_exceptions=True)
+        for task in session_manager.background_tasks:
+            task.cancel()
+        await asyncio.gather(
+            *background_tasks, bootstrap_task, stop_waiter,
+            *session_manager.background_tasks, return_exceptions=True,
+        )
 
         await repo.close()
-        for client, name in ((user_client, "user client"), (bot_client, "bot client")):
+        # session_manager.clients already includes the owner's client (the
+        # same user_client object seeded above), so this alone covers every
+        # currently-connected user account.
+        for telegram_id, client in session_manager.clients.items():
             try:
                 await client.disconnect()
             except Exception:
-                logger.exception("Error disconnecting %s during shutdown", name)
+                logger.exception("Error disconnecting client for user %s during shutdown", telegram_id)
+        try:
+            await bot_client.disconnect()
+        except Exception:
+            logger.exception("Error disconnecting bot client during shutdown")
 
 
 def main() -> None:

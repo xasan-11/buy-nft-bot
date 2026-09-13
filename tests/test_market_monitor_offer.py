@@ -9,6 +9,8 @@ from src.monitoring.channel_monitor import MonitorState
 from src.monitoring.market_monitor import MarketMonitor
 from src.monitoring.offer_state import OfferState
 
+USER_ID = 111
+
 
 class FakeUniqueGift:
     def __init__(self, slug, price=999, offer_min_stars=None, owner_id="owner", title=None):
@@ -138,14 +140,14 @@ async def make_monitor(
     await state.load()
     await state.start()
 
-    offer_state = OfferState(repo)
+    offer_state = OfferState(repo, USER_ID)
     await offer_state.load()
     if offer_active_target or unbounded:
         await offer_state.start()
         # Every test in this module uses gift_id=1 unless it says otherwise
         # via selected_gift_types — default the picker's selection to match
         # so existing assertions don't all need to opt in explicitly.
-        await repo.set_offer_selected_gift_types(
+        await repo.set_user_offer_selected_gift_types(USER_ID, 
             selected_gift_types if selected_gift_types is not None else {1}
         )
 
@@ -217,7 +219,7 @@ async def test_offer_skipped_when_owner_has_not_enabled_offers(repo):
 
 
 async def test_offer_skipped_when_configured_price_below_minimum(repo):
-    await repo.set_offer_price(50)
+    await repo.set_user_offer_price(USER_ID, 50)
     monitor, notifier, offer_state = await make_monitor(
         repo, offer_active_target=1, profile=SellerProfile(level=1, gift_count=0)
     )
@@ -322,7 +324,7 @@ async def test_offer_stopped_mid_flight_before_send_is_aborted(repo):
     await state.load()
     await state.start()
 
-    offer_state = OfferState(repo)
+    offer_state = OfferState(repo, USER_ID)
     await offer_state.load()
     await offer_state.start()
 
@@ -457,7 +459,7 @@ async def test_check_balance_once_does_nothing_when_not_paused(repo):
 async def test_check_balance_once_stays_paused_when_balance_still_low(repo):
     monitor, notifier, offer_state = await make_monitor(repo, unbounded=True, balance_amount=50)
     await offer_state.pause()
-    await repo.set_offer_price(125)
+    await repo.set_user_offer_price(USER_ID, 125)
 
     await monitor.check_balance_once()
 
@@ -468,7 +470,7 @@ async def test_check_balance_once_stays_paused_when_balance_still_low(repo):
 async def test_check_balance_once_resumes_when_balance_is_sufficient(repo):
     monitor, notifier, offer_state = await make_monitor(repo, unbounded=True, balance_amount=200)
     await offer_state.pause()
-    await repo.set_offer_price(125)
+    await repo.set_user_offer_price(USER_ID, 125)
 
     await monitor.check_balance_once()
 
@@ -479,7 +481,7 @@ async def test_check_balance_once_resumes_when_balance_is_sufficient(repo):
 async def test_check_balance_once_resumes_at_exact_threshold(repo):
     monitor, notifier, offer_state = await make_monitor(repo, unbounded=True, balance_amount=125)
     await offer_state.pause()
-    await repo.set_offer_price(125)
+    await repo.set_user_offer_price(USER_ID, 125)
 
     await monitor.check_balance_once()
 
@@ -490,7 +492,7 @@ async def test_check_balance_once_sends_only_one_resume_notification(repo):
     """Mirrors the pause-side race guard: resume() only returns True once."""
     monitor, notifier, offer_state = await make_monitor(repo, unbounded=True, balance_amount=200)
     await offer_state.pause()
-    await repo.set_offer_price(125)
+    await repo.set_user_offer_price(USER_ID, 125)
 
     await monitor.check_balance_once()
     await monitor.check_balance_once()  # a second tick after already-resumed

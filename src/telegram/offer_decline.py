@@ -14,10 +14,12 @@ logger = logging.getLogger("offer_decline")
 def register_offer_decline_handlers(
     user_client,
     repo: Repository,
+    telegram_id: int,
     folder_finder=find_offer_folder,
     folder_remover=remove_peer_id_from_folder,
 ) -> None:
-    """Watches for a resale-gift purchase offer being declined or expiring.
+    """Watches for a resale-gift purchase offer being declined or expiring,
+    on one specific user's own TelegramClient.
 
     Per core.telegram.org/api/gifts#collectible-gift-purchase-offers: "If
     the offer is declined or if it expires, a messageActionStarGiftPurchaseOfferDeclined
@@ -28,6 +30,13 @@ def register_offer_decline_handlers(
     both events.NewMessage and events.MessageEdited are watched here;
     either way the seller's peer is resolved from the update's own chat,
     never re-fetched separately.
+
+    `telegram_id` scopes every lookup/update to this user's own offers —
+    each user's account only ever sees decline events for offers *it* sent
+    (Telegram delivers this service message straight into that account's
+    own DM with the seller), but the underlying star_gift_offers table is
+    shared across every user, so the query itself must still be scoped
+    explicitly to avoid ever touching another user's row.
     """
 
     async def _handle(event) -> None:
@@ -40,13 +49,13 @@ def register_offer_decline_handlers(
         if not slug:
             return  # not a unique collectible offer (shouldn't happen) — nothing to match
 
-        owner_peer_id = await repo.get_offer_owner_peer_id(slug)
-        await repo.update_offer_status(slug, OfferStatus.DECLINED)
+        owner_peer_id = await repo.get_offer_owner_peer_id(telegram_id, slug)
+        await repo.update_offer_status(telegram_id, slug, OfferStatus.DECLINED)
 
         if owner_peer_id is None:
             return  # this offer predates the feature or wasn't ours — nothing more to do
 
-        remaining = await repo.count_pending_offers_for_peer(owner_peer_id)
+        remaining = await repo.count_pending_offers_for_peer(telegram_id, owner_peer_id)
         if remaining > 0:
             return  # seller still has other active offers — stays in the folder
 

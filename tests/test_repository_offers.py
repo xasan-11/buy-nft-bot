@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from src.database.repository import OfferStatus
 
+USER_ID = 111
+
 
 async def test_offer_settings_defaults(repo):
     assert await repo.get_offer_level() == 1
@@ -70,11 +72,11 @@ async def test_offer_selected_gift_types_can_be_cleared(repo):
 
 async def test_claim_offer_slot_dedups_by_slug(repo):
     claimed_first = await repo.claim_offer_slot(
-        offer_id=1, slug="Gift-1", gift_id=42, price_stars=125,
+        USER_ID, offer_id=1, slug="Gift-1", gift_id=42, price_stars=125,
         duration_seconds=21600, expires_at="2026-01-01T00:00:00+00:00",
     )
     claimed_second = await repo.claim_offer_slot(
-        offer_id=2, slug="Gift-1", gift_id=42, price_stars=125,
+        USER_ID, offer_id=2, slug="Gift-1", gift_id=42, price_stars=125,
         duration_seconds=21600, expires_at="2026-01-01T00:00:00+00:00",
     )
 
@@ -82,12 +84,28 @@ async def test_claim_offer_slot_dedups_by_slug(repo):
     assert claimed_second is False
 
 
-async def test_mark_offer_failed_and_stats(repo):
-    await repo.claim_offer_slot(
-        offer_id=1, slug="Gift-2", gift_id=42, price_stars=125,
+async def test_claim_offer_slot_allows_different_users_same_slug(repo):
+    """Sending an offer doesn't reserve the gift the way a purchase does —
+    two different users can each independently offer on the same slug."""
+    claimed_owner = await repo.claim_offer_slot(
+        USER_ID, offer_id=1, slug="Gift-1", gift_id=42, price_stars=125,
         duration_seconds=21600, expires_at="2026-01-01T00:00:00+00:00",
     )
-    await repo.mark_offer_failed("Gift-2", "RESELL_STARS_TOO_FEW")
+    claimed_other = await repo.claim_offer_slot(
+        222, offer_id=2, slug="Gift-1", gift_id=42, price_stars=125,
+        duration_seconds=21600, expires_at="2026-01-01T00:00:00+00:00",
+    )
+
+    assert claimed_owner is True
+    assert claimed_other is True
+
+
+async def test_mark_offer_failed_and_stats(repo):
+    await repo.claim_offer_slot(
+        USER_ID, offer_id=1, slug="Gift-2", gift_id=42, price_stars=125,
+        duration_seconds=21600, expires_at="2026-01-01T00:00:00+00:00",
+    )
+    await repo.mark_offer_failed(USER_ID, "Gift-2", "RESELL_STARS_TOO_FEW")
 
     stats = await repo.get_offer_stats()
     assert stats["total"] == 1
@@ -97,10 +115,10 @@ async def test_mark_offer_failed_and_stats(repo):
 
 async def test_update_offer_status(repo):
     await repo.claim_offer_slot(
-        offer_id=1, slug="Gift-3", gift_id=42, price_stars=125,
+        USER_ID, offer_id=1, slug="Gift-3", gift_id=42, price_stars=125,
         duration_seconds=21600, expires_at="2026-01-01T00:00:00+00:00",
     )
-    await repo.update_offer_status("Gift-3", OfferStatus.ACCEPTED)
+    await repo.update_offer_status(USER_ID, "Gift-3", OfferStatus.ACCEPTED)
 
     stats = await repo.get_offer_stats()
     assert stats["accepted"] == 1
@@ -108,11 +126,11 @@ async def test_update_offer_status(repo):
 
 async def test_expire_stale_offers_flips_only_past_expiry(repo):
     await repo.claim_offer_slot(
-        offer_id=1, slug="Gift-expired", gift_id=42, price_stars=125,
+        USER_ID, offer_id=1, slug="Gift-expired", gift_id=42, price_stars=125,
         duration_seconds=1, expires_at="2000-01-01T00:00:00+00:00",
     )
     await repo.claim_offer_slot(
-        offer_id=2, slug="Gift-future", gift_id=42, price_stars=125,
+        USER_ID, offer_id=2, slug="Gift-future", gift_id=42, price_stars=125,
         duration_seconds=999999, expires_at="2999-01-01T00:00:00+00:00",
     )
 

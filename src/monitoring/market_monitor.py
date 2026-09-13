@@ -87,6 +87,8 @@ class MarketMonitor:
         purchase_executor: Callable = execute_purchase,
         request_spacing_seconds: float = MIN_REQUEST_SPACING_SECONDS,
         offer_state=None,
+        offer_registry=None,
+        session_manager=None,
         offer_executor: Callable = send_offer,
         seller_profile_fetcher: Callable = get_seller_profile,
         balance_fetcher: Callable = get_stars_balance,
@@ -100,11 +102,26 @@ class MarketMonitor:
         self.scan_interval = max(poll_interval, MIN_SCAN_INTERVAL_SECONDS)
         self.listings_per_gift = listings_per_gift
         self.purchase_executor = purchase_executor
-        # Independent auto-offer pipeline (▶️ Start offer / ⏹ Stop offer) —
+        # Independent auto-offer pipeline (▶️ Start offer / ⏹ Stop offer),
         # entirely separate state/dedup/action from the MAX_NFT_PRICE direct
-        # purchase above. offer_state is None until main.py wires it up;
-        # _maybe_send_offer no-ops in that case (e.g. in older tests).
+        # purchase above. Listing *scanning* always stays on self.user_client
+        # (one shared account/API-request stream — see the module docstring
+        # for why), but each matching listing is then evaluated and, if
+        # eligible, offered on separately for every currently-active user,
+        # each using that user's own TelegramClient — see _offer_targets().
+        #
+        # Two ways to supply targets, and exactly one is used:
+        #  - offer_state alone: a single legacy target using self.user_client
+        #    itself (what every pre-multi-tenant caller, and most of this
+        #    module's own tests, still pass).
+        #  - offer_registry + session_manager: the real multi-tenant path —
+        #    every currently-active, currently-logged-in user is a target,
+        #    each with its own client (see monitoring/offer_registry.py and
+        #    telegram/user_manager.py).
+        # Neither given means the auto-offer pipeline is simply off.
         self.offer_state = offer_state
+        self.offer_registry = offer_registry
+        self.session_manager = session_manager
         self.offer_executor = offer_executor
         self.seller_profile_fetcher = seller_profile_fetcher
         self.balance_fetcher = balance_fetcher
@@ -343,29 +360,65 @@ class MarketMonitor:
                 unique.slug, outcome.price_stars or estimate, "market", outcome.error
             )
 
-    async def _maybe_send_offer(self, gift_id: int, unique) -> None:
-        """Evaluates one freshly-claimed listing for the auto-offer pipeline.
+    async def _offer_targets(self):
+        """Yields (telegram_id, client, offer_state) for every user whose
+        offer run should be evaluated against the listing just found.
 
-        Runs only while an admin has an active "🎯 Offer boshlash" run, and
-        only for gift *types* chosen in that run's gift-type picker — every
-        other gift type is ignored regardless of how well its listings would
-        otherwise match. Independent of MAX_NFT_PRICE: a listing can be too
-        expensive to buy outright and still get an offer, or vice versa. A
-        listing is only ever evaluated once, at the moment it is first
-        claimed by claim_listing (same lifecycle as the purchase path) —
-        this is not re-checked on later polls.
+        Multi-tenant path: constructed with offer_registry + session_manager
+        (see monitoring/offer_registry.py, telegram/user_manager.py) —
+        every currently-active user with a live, authorized client of their
+        own is yielded, each acted on entirely through their own client.
+
+        Single legacy target: constructed with a plain `offer_state`
+        instead (no registry) — everything runs through self.user_client,
+        exactly like the single-tenant app did before. This is what most of
+        this module's own test suite still uses directly.
+
+        Neither given means the auto-offer pipeline is simply off — this
+        yields nothing and _maybe_send_offer becomes a no-op.
         """
-        if self.offer_state is None or not self.offer_state.is_active():
+        if self.offer_registry is not None and self.session_manager is not None:
+            for telegram_id, offer_state in await self.offer_registry.active():
+                client = self.session_manager.get_client(telegram_id)
+                if client is None or not self.session_manager.is_ready(telegram_id):
+                    continue
+                yield telegram_id, client, offer_state
+            return
+
+        if self.offer_state is not None:
+            yield self.offer_state.telegram_id, self.user_client, self.offer_state
+
+    async def _maybe_send_offer(self, gift_id: int, unique) -> None:
+        """Evaluates one freshly-claimed listing for the auto-offer
+        pipeline, independently for every user whose run is currently
+        active (see _offer_targets) — one user's listing evaluation/offer
+        never affects another's, and each sends from their own account.
+        """
+        async for telegram_id, client, offer_state in self._offer_targets():
+            await self._maybe_send_offer_for_user(telegram_id, client, offer_state, gift_id, unique)
+
+    async def _maybe_send_offer_for_user(self, telegram_id, client, offer_state, gift_id: int, unique) -> None:
+        """Runs only while this user has an active "🎯 Offer boshlash" run,
+        and only for gift *types* chosen in that run's gift-type picker —
+        every other gift type is ignored regardless of how well its
+        listings would otherwise match. Independent of MAX_NFT_PRICE: a
+        listing can be too expensive to buy outright and still get an
+        offer, or vice versa. A listing is only ever evaluated once per
+        user, at the moment it is first claimed by claim_listing (same
+        lifecycle as the purchase path) — this is not re-checked on later
+        polls.
+        """
+        if not offer_state.is_active():
             return
 
         # Paused for low balance (see notify_offer_paused/balance_watch_loop)
         # — do absolutely nothing until the balance-watch loop resumes this,
         # so a queue of otherwise-matching listings never produces a wall of
         # repeated BALANCE_TOO_LOW attempts/notifications.
-        if self.offer_state.is_paused():
+        if offer_state.is_paused():
             return
 
-        selected_gift_types = await self.repo.get_offer_selected_gift_types()
+        selected_gift_types = await self.repo.get_user_offer_selected_gift_types(telegram_id)
         if gift_id not in selected_gift_types:
             return
 
@@ -373,7 +426,7 @@ class MarketMonitor:
         if offer_min_stars is None:
             return  # this owner hasn't enabled offers on this gift at all
 
-        offer_price = await self.repo.get_offer_price()
+        offer_price = await self.repo.get_user_offer_price(telegram_id)
         if offer_price < offer_min_stars:
             return  # would fail with RESELL_STARS_TOO_FEW
 
@@ -381,12 +434,12 @@ class MarketMonitor:
         if owner_peer is None:
             return
 
-        profile = await self.seller_profile_fetcher(self.user_client, owner_peer)
+        profile = await self.seller_profile_fetcher(client, owner_peer)
         if profile is None:
             return  # couldn't verify the seller — fail closed, no offer
 
-        required_level = await self.repo.get_offer_level()
-        max_nft_count = await self.repo.get_offer_nft_count()
+        required_level = await self.repo.get_user_offer_level(telegram_id)
+        max_nft_count = await self.repo.get_user_offer_nft_count(telegram_id)
         if profile.level != required_level or profile.gift_count >= max_nft_count:
             return
 
@@ -395,14 +448,14 @@ class MarketMonitor:
         # landed while the seller-profile lookup above was in flight must
         # still prevent this specific send, exactly like the purchase
         # pipeline's pre-payment re-check.
-        if not self.offer_state.is_active() or self.offer_state.is_paused():
+        if not offer_state.is_active() or offer_state.is_paused():
             return
 
-        duration_hours = await self.repo.get_offer_expiry_hours()
+        duration_hours = await self.repo.get_user_offer_expiry_hours(telegram_id)
         duration_seconds = duration_hours * 3600
         expires_at = (dt.datetime.now(dt.timezone.utc) + dt.timedelta(seconds=duration_seconds)).isoformat()
 
-        outcome = await self.offer_executor(self.user_client, owner_peer, unique.slug, offer_price, duration_seconds)
+        outcome = await self.offer_executor(client, owner_peer, unique.slug, offer_price, duration_seconds)
 
         try:
             owner_peer_id = utils.get_peer_id(owner_peer)
@@ -410,6 +463,7 @@ class MarketMonitor:
             owner_peer_id = None
 
         claimed = await self.repo.claim_offer_slot(
+            telegram_id,
             offer_id=outcome.offer_id or 0,
             slug=unique.slug,
             gift_id=gift_id,
@@ -419,10 +473,10 @@ class MarketMonitor:
             owner_peer_id=owner_peer_id,
         )
         if not claimed:
-            return  # already offered on this slug (shouldn't happen given claim_listing, but stay safe)
+            return  # this user already offered on this slug — stay safe
 
         if outcome.success:
-            await self.offer_state.record_sent()
+            await offer_state.record_sent()
             await self.notifier.notify_offer_sent(
                 self._display_name(unique),
                 offer_price,
@@ -430,9 +484,9 @@ class MarketMonitor:
                 self._listing_link(unique, gift_id),
                 profile.profile_link,
             )
-            await self._add_seller_to_offer_folder(owner_peer)
+            await self._add_seller_to_offer_folder(client, owner_peer)
         else:
-            await self.repo.mark_offer_failed(unique.slug, outcome.error or "unknown error")
+            await self.repo.mark_offer_failed(telegram_id, unique.slug, outcome.error or "unknown error")
             # Prefer the structured flag set at the source (send_offer reads
             # the RPCError's raw .message there); fall back to scanning the
             # formatted error text for any executor that doesn't set it.
@@ -443,21 +497,22 @@ class MarketMonitor:
                 # other matching listing this cycle (and every future one,
                 # until the balance recovers) is silently skipped by the
                 # is_paused() guards above — no "Offer tashlanmadi" spam.
-                if await self.offer_state.pause():
+                if await offer_state.pause():
                     await self.notifier.notify_offer_paused()
             else:
                 await self.notifier.notify_offer_failed(self._display_name(unique), offer_price, outcome.error)
 
-    async def _add_seller_to_offer_folder(self, owner_peer) -> None:
-        """Adds the listing owner to the "Offer" Chat Folder right after a
-        successful send, via messages.getDialogFilters + messages.updateDialogFilter
-        (see marketplace/offer_folder.py). Never lets a folder problem
-        affect the offer pipeline itself — every failure is caught and only
-        logged, and a missing folder is reported to admins at most once per
-        process lifetime rather than after every single offer.
+    async def _add_seller_to_offer_folder(self, client, owner_peer) -> None:
+        """Adds the listing owner to this user's own "Offer" Chat Folder
+        right after a successful send, via messages.getDialogFilters +
+        messages.updateDialogFilter (see marketplace/offer_folder.py). Never
+        lets a folder problem affect the offer pipeline itself — every
+        failure is caught and only logged, and a missing folder is reported
+        at most once per process lifetime rather than after every single
+        offer.
         """
         try:
-            folder = await self.offer_folder_finder(self.user_client, OFFER_FOLDER_NAME)
+            folder = await self.offer_folder_finder(client, OFFER_FOLDER_NAME)
         except Exception:
             logger.exception("Failed to look up the '%s' chat folder", OFFER_FOLDER_NAME)
             return
@@ -469,7 +524,7 @@ class MarketMonitor:
             return
 
         try:
-            await self.offer_folder_adder(self.user_client, folder, owner_peer)
+            await self.offer_folder_adder(client, folder, owner_peer)
         except Exception:
             logger.exception("Failed to add seller to the '%s' chat folder", OFFER_FOLDER_NAME)
 
@@ -518,22 +573,23 @@ class MarketMonitor:
             await self.check_balance_once()
 
     async def check_balance_once(self) -> None:
-        """One tick of the balance watch: a no-op unless the offer run is
-        both active and currently paused, so this never spends an API call
-        needlessly (e.g. while no offer run is happening at all)."""
-        if self.offer_state is None:
-            return
-        if not self.offer_state.is_active() or not self.offer_state.is_paused():
-            return
+        """One tick of the balance watch, run independently for every
+        current offer target (see _offer_targets) — each user's own balance
+        only ever resumes *their own* run. A no-op for any user whose run
+        isn't both active and currently paused, so this never spends an API
+        call needlessly (e.g. while no offer run is happening at all)."""
+        async for telegram_id, client, offer_state in self._offer_targets():
+            if not offer_state.is_active() or not offer_state.is_paused():
+                continue
 
-        balance = await self.balance_fetcher(self.user_client)
-        if balance is None:
-            return
+            balance = await self.balance_fetcher(client)
+            if balance is None:
+                continue
 
-        required = await self.repo.get_offer_price()
-        if balance >= required:
-            if await self.offer_state.resume():
-                await self.notifier.notify_offer_resumed(balance, required)
+            required = await self.repo.get_user_offer_price(telegram_id)
+            if balance >= required:
+                if await offer_state.resume():
+                    await self.notifier.notify_offer_resumed(balance, required)
 
     def _log_first_scan_if_needed(self) -> None:
         if self._first_scan_logged:

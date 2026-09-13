@@ -1,9 +1,15 @@
 # Telegram NFT/Gift Auto-Purchase Monitor
 
 Monitors Telegram channels for links to collectible Telegram Gifts (NFTs)
-listed for resale, and automatically buys them with your own Telegram
-account using Telegram Stars — but only when the price is **200 ⭐ or
-less**. Administration happens through a separate, admin-only control bot.
+listed for resale, and automatically buys them with the **owner's**
+Telegram account using Telegram Stars — but only when the price is
+**200 ⭐ or less**. Channel/market monitoring and administration happen
+through a separate control bot, restricted to the owner.
+
+**Multi-tenant offer-tashlash:** on top of that, *any* Telegram user can
+`/start` the control bot, connect their **own** personal account with
+`/login`, and run their own independent auto-offer pipeline against the
+same shared market scan — see "Multi-tenant offer-tashlash" below.
 
 ## How buying actually works (read this first)
 
@@ -102,8 +108,12 @@ itself, so no local step is required at all.
 
 ### Logging in through the control bot (`/login`, `/code`, `/password`)
 
-Only the account in `OWNER_TELEGRAM_ID` can use these — not even another
-admin. When the user account isn't authorized, the bot messages the owner:
+**Any Telegram user can `/login` their own account** — not just the owner.
+Each user's session is stored independently (see "Multi-tenant
+offer-tashlash" below); this section describes the flow, which is
+identical for everyone, using the owner as the example since the owner's
+account is also what powers channel/market monitoring. When the owner's
+account specifically isn't authorized yet, the bot messages the owner:
 
 - If `TELEGRAM_PHONE` is set, it skips straight to sending the code and
   says **"📩 Kod yuborildi. Iltimos kodni shu yerga yozing: /code 12345
@@ -233,11 +243,20 @@ indefinitely with no repeated setup.
 ## Using the control bot
 
 Open a DM with your control bot on Telegram (the one behind
-`CONTROL_BOT_TOKEN`) and send commands there. Every command checks the
-sender's numeric Telegram user ID against the `admins` table — usernames
-are never trusted for authorization. Unauthorized users get:
+`CONTROL_BOT_TOKEN`) and send commands there.
 
-> ⛔ You are not authorized to use this bot.
+There are two permission tiers, checked by numeric Telegram user ID —
+usernames are never trusted for authorization:
+
+- **Owner** (`OWNER_TELEGRAM_ID`) — full access to everything below:
+  admin management, channel management, channel/market monitoring, and
+  their own offer-tashlash settings.
+- **Everyone else** (including anyone added via `/addadmin` — being listed
+  as an admin no longer grants anything extra) — can only `/login` their
+  own account and run their own offer-tashlash pipeline. Every command
+  below that isn't `/login`/`/setoffer*`/the gift-type picker replies:
+
+  > ⛔ You are not authorized to use this bot.
 
 ### Adding administrators (owner only)
 
@@ -309,7 +328,74 @@ Successful purchases: 20
 Failed purchases: 5
 ```
 
-## Auto-offer (🎯 Offer boshlash / 🛑 Offer to'xtatish)
+### ⭐ Stars / ⭐ Take stars (owner only)
+
+Two owner-only tools for directly managing the Stars balance of any
+account that has completed `/login` through this bot — each acts strictly
+through that account's own authorization, never anyone else's, since
+that's the only way Telegram allows either operation at all.
+
+- **⭐ Stars** (`/stars <account_id>`) — reports that account's current
+  Stars balance via
+  [`payments.getStarsStatus`](https://core.telegram.org/method/payments.getStarsStatus)
+  (`peer=inputPeerSelf`) — the same official method channel/market
+  monitoring's balance-watch loop already uses (`src/marketplace/balance.py`).
+- **⭐ Take stars** (`/takestars <account_id> <post_link>`) — sends that
+  account's *entire* current Stars balance as one paid reaction to the
+  given post, via
+  [`messages.sendPaidReaction`](https://core.telegram.org/method/messages.sendPaidReaction).
+  This method isn't in Telethon's generated schema yet (checked against
+  1.45.0, the latest release on PyPI, at the time this was written), so
+  it's hand-written in `src/marketplace/paid_reaction.py` against the
+  official schema — `messages.sendPaidReaction#58bbcb50 flags:#
+  peer:InputPeer msg_id:int count:int random_id:long
+  private:flags.0?PaidReactionPrivacy = Updates;` — and its binary
+  encoding is round-trip tested against Telethon's own `BinaryReader` in
+  `tests/test_paid_reaction.py`. Since a single reaction is capped at 2500
+  Stars in Telegram's own UI, a balance above that is sent in successive
+  2500-Star chunks until it's exhausted or a call fails (in which case
+  whatever went through already stays sent, and the reply reports exactly
+  how much and what's left).
+
+Both buttons drive a two-step prompt (account ID, then — for Take stars —
+the post link); the slash commands take both arguments at once. Post
+links are parsed with `src/marketplace/post_link.py`: plain
+`t.me/<channel>/<msg_id>`, the `t.me/s/...` preview form, and
+`t.me/c/<internal_id>/<msg_id>` for private channels (only resolvable if
+the target account has already seen/joined that channel — Telegram gives
+no other way to look up a private channel by that id).
+
+## Multi-tenant offer-tashlash
+
+Any Telegram user — owner, admin, or a complete stranger who has never
+been added anywhere — can `/start` the control bot and use this feature
+with their **own** Telegram account:
+
+1. `/login +998901234567` (see "Logging in through the control bot" above)
+   — connects that user's own personal account, with its own session
+   stored in the `users` table, completely isolated from everyone else's.
+2. `/setofferlevel`, `/setoffernftcount`, `/setofferprice`, `/setofferexpiry`
+   — each user's own settings, independent of everyone else's (including
+   the owner's).
+3. **🎯 Offer boshlash** — pick gift types and start; **🛑 Offer
+   to'xtatish** — stop. Each user's run (active/paused/sent-count) is
+   fully independent.
+
+**Architecture — one shared scan, many independent senders:** listing
+*discovery* (`payments.getResaleStarGifts`) stays a single scan on the
+owner's account — this is deliberately **not** one poll per user. Running
+N independent pollers for N users would multiply Telegram API traffic by N
+for the exact same listings and risk `FloodWaitError` under any real
+number of users; instead, every listing the one shared scan finds is
+evaluated against **every currently-active user's own filters** (level,
+NFT count, price, gift types, expiry), and whichever users match each
+independently send their own offer through their own account (so multiple
+different users can each offer on the same listing — sending an offer
+doesn't reserve the gift the way a purchase does). See
+`src/monitoring/market_monitor.py`'s `_offer_targets`/`_maybe_send_offer_for_user`
+and `src/monitoring/offer_registry.py`.
+
+## Auto-offer mechanics (🎯 Offer boshlash / 🛑 Offer to'xtatish)
 
 Independent of the direct-purchase pipeline above: instead of buying a
 resale listing outright, the bot can propose a price to the seller via
@@ -336,7 +422,7 @@ finds anything while market monitoring is `RUNNING`), but its decision is
 completely separate from `MAX_NFT_PRICE`: a listing can be too expensive to
 buy outright and still get an offer, or vice versa.
 
-### Configuring the offer filter (owner/admin only)
+### Configuring the offer filter (any user — their own settings)
 
 ```
 /setofferlevel <N>        Required seller level, exact match (default 1)
@@ -435,13 +521,16 @@ Sent by the control bot to the owner and every current administrator:
   is saved in `data/app.db`, never in `.env` or any other file that could
   end up committed to git.
 - `/login`, `/code` and `/password` — the only place the control bot ever
-  touches your login code or 2FA password — work **only** for the exact
-  account in `OWNER_TELEGRAM_ID`, not even another admin. Outside of that
-  flow, the control bot never asks for, stores, or logs your Telegram
-  password; `generate_session.py`'s 2FA prompt uses `getpass` (hidden
-  terminal input) for the same reason.
-- No admin command works without the sender's numeric Telegram user ID
-  being present in the `admins` table. Usernames are never used for
+  touches a login code or 2FA password — work for **any** Telegram user,
+  each strictly on their own account/session; the control bot never asks
+  for, stores, or logs anyone's Telegram password. `generate_session.py`'s
+  2FA prompt uses `getpass` (hidden terminal input) for the same reason.
+  One user's session is never exposed to, or usable by, another.
+- No owner-only command (channel/market monitoring, channel-list
+  management, `/setmaxprice`, `/status`, `/addadmin`/`/removeadmin`) works
+  for anyone but the exact account in `OWNER_TELEGRAM_ID`. Being listed in
+  the `admins` table (via `/addadmin`) grants nothing beyond what any
+  other logged-in user already has. Usernames are never used for
   authorization decisions.
 - Nothing here bypasses Telegram's rate limits: `FloodWaitError` is caught
   and surfaced as a failed attempt rather than retried in a tight loop.
@@ -488,12 +577,17 @@ retried immediately.
 src/
   config/       settings.py          — env loading
   database/     models.py, repository.py — SQLite schema + async repository
-  telegram/     client.py, login_flow.py, updates.py — Telethon wiring
-                (StringSession-based; login_flow.py is the bot-mediated
-                /login, /code, /password flow)
-  monitoring/   nft_detector.py, price_parser.py, channel_monitor.py
+                (users table = per-user session + offer settings/state)
+  telegram/     client.py, user_manager.py, updates.py — Telethon wiring
+                (StringSession-based; user_manager.py is the multi-tenant,
+                bot-mediated /login, /code, /password flow — one
+                TelegramClient per user)
+  monitoring/   nft_detector.py, price_parser.py, channel_monitor.py,
+                market_monitor.py, offer_state.py, offer_registry.py
+                (offer_registry.py = per-user OfferState cache)
   marketplace/  listing.py, purchase.py — the real MTProto buy flow
-  bot/          authorization.py, bot_app.py — control bot commands
+  bot/          authorization.py, bot_app.py, keyboard.py, menu.py —
+                control bot commands (owner-only vs. offer-tashlash split)
   notifications/notifier.py
   main.py
 generate_session.py — one-time interactive login that prints a StringSession

@@ -26,13 +26,34 @@ class PurchaseResult:
     FAILED = "FAILED"
 
 
+class OfferStatus:
+    PENDING = "PENDING"
+    ACCEPTED = "ACCEPTED"
+    DECLINED = "DECLINED"
+    EXPIRED = "EXPIRED"
+    FAILED = "FAILED"
+
+
 MONITORING_KEY = "monitoring_status"
 MARKET_MONITORING_KEY = "market_monitoring_status"
 MAX_PRICE_KEY = "max_nft_price"
 MARKET_POLL_CONCURRENCY_KEY = "market_poll_concurrency"
 VERBOSE_POLL_LOG_KEY = "verbose_poll_log"
+VERBOSE_POLL_INTERVAL_KEY = "verbose_poll_interval"
+OFFER_LEVEL_KEY = "offer_seller_level"
+OFFER_NFT_COUNT_KEY = "offer_seller_max_nft_count"
+OFFER_PRICE_KEY = "offer_price_stars"
+OFFER_EXPIRY_HOURS_KEY = "offer_expiry_hours"
+OFFER_ACTIVE_KEY = "offer_active"
+OFFER_SENT_KEY = "offer_sent_count"
+OFFER_SELECTED_GIFT_TYPES_KEY = "offer_selected_gift_types"
+OFFER_PAUSED_KEY = "offer_paused"
 STATUS_RUNNING = "RUNNING"
 STATUS_STOPPED = "STOPPED"
+
+# payments.sendStarGiftOffer only accepts one of these exact durations (in
+# seconds) — see core.telegram.org/method/payments.sendStarGiftOffer.
+ALLOWED_OFFER_HOURS = (6, 12, 24, 36, 48, 72)
 
 
 def _now() -> str:
@@ -58,8 +79,19 @@ class Repository:
         default_max_price: int = 200,
         default_market_poll_concurrency: int = 3,
     ) -> None:
-        self._conn = await aiosqlite.connect(self._db_path)
+        # timeout=8 gives Python's own sqlite3 busy-wait the same ceiling as
+        # the PRAGMA below — belt and suspenders, since aiosqlite just
+        # forwards this straight to sqlite3.connect().
+        self._conn = await aiosqlite.connect(self._db_path, timeout=8.0)
         self._conn.row_factory = aiosqlite.Row
+        # Set before executescript (which would otherwise run its own first
+        # statement, the schema's PRAGMA journal_mode=WAL, inside an
+        # implicit transaction boundary) so a concurrent reader/writer never
+        # sees this connection with default (DELETE) journal mode even for
+        # an instant, and so busy_timeout is guaranteed to be in effect for
+        # every statement that follows, including schema creation itself.
+        await self._conn.execute("PRAGMA journal_mode=WAL")
+        await self._conn.execute("PRAGMA busy_timeout=8000")
         await self._conn.executescript(SCHEMA)
         await self._conn.commit()
         await self._migrate()
@@ -73,6 +105,15 @@ class Repository:
             MARKET_POLL_CONCURRENCY_KEY, str(default_market_poll_concurrency)
         )
         await self._ensure_default_setting(VERBOSE_POLL_LOG_KEY, "OFF")
+        await self._ensure_default_setting(VERBOSE_POLL_INTERVAL_KEY, "5")
+        await self._ensure_default_setting(OFFER_LEVEL_KEY, "1")
+        await self._ensure_default_setting(OFFER_NFT_COUNT_KEY, "3")
+        await self._ensure_default_setting(OFFER_PRICE_KEY, "125")
+        await self._ensure_default_setting(OFFER_EXPIRY_HOURS_KEY, "6")
+        await self._ensure_default_setting(OFFER_ACTIVE_KEY, "OFF")
+        await self._ensure_default_setting(OFFER_SENT_KEY, "0")
+        await self._ensure_default_setting(OFFER_SELECTED_GIFT_TYPES_KEY, "")
+        await self._ensure_default_setting(OFFER_PAUSED_KEY, "OFF")
 
     async def _migrate(self) -> None:
         """Adds columns introduced after the original schema to an existing
@@ -83,6 +124,14 @@ class Repository:
         if "source" not in columns:
             await self._conn.execute(
                 "ALTER TABLE processed_listings ADD COLUMN source TEXT NOT NULL DEFAULT 'channel'"
+            )
+            await self._conn.commit()
+
+        cur = await self._conn.execute("PRAGMA table_info(star_gift_offers)")
+        offer_columns = {row["name"] for row in await cur.fetchall()}
+        if "owner_peer_id" not in offer_columns:
+            await self._conn.execute(
+                "ALTER TABLE star_gift_offers ADD COLUMN owner_peer_id INTEGER"
             )
             await self._conn.commit()
 
@@ -232,6 +281,194 @@ class Repository:
 
     async def set_verbose_poll_log(self, enabled: bool) -> None:
         await self.set_setting(VERBOSE_POLL_LOG_KEY, "ON" if enabled else "OFF")
+
+    async def get_verbose_poll_interval(self) -> int:
+        """Seconds between aggregated verbose "checked" messages (0 means
+        send one message per listing immediately, with no aggregation).
+        Independent of MARKET_POLL_INTERVAL_SECONDS — this only controls
+        how often verbose notifications are *flushed*, not how often
+        Telegram is actually polled for listings."""
+        value = await self.get_setting(VERBOSE_POLL_INTERVAL_KEY)
+        return int(value) if value is not None else 5
+
+    async def set_verbose_poll_interval(self, seconds: int) -> None:
+        await self.set_setting(VERBOSE_POLL_INTERVAL_KEY, str(seconds))
+
+    # --------------------------------------------------- offer configuration
+    async def get_offer_level(self) -> int:
+        value = await self.get_setting(OFFER_LEVEL_KEY)
+        return int(value) if value is not None else 1
+
+    async def set_offer_level(self, value: int) -> None:
+        await self.set_setting(OFFER_LEVEL_KEY, str(value))
+
+    async def get_offer_nft_count(self) -> int:
+        """Sellers must own FEWER than this many gifts to be offer-eligible."""
+        value = await self.get_setting(OFFER_NFT_COUNT_KEY)
+        return int(value) if value is not None else 3
+
+    async def set_offer_nft_count(self, value: int) -> None:
+        await self.set_setting(OFFER_NFT_COUNT_KEY, str(value))
+
+    async def get_offer_price(self) -> int:
+        value = await self.get_setting(OFFER_PRICE_KEY)
+        return int(value) if value is not None else 125
+
+    async def set_offer_price(self, value: int) -> None:
+        await self.set_setting(OFFER_PRICE_KEY, str(value))
+
+    async def get_offer_expiry_hours(self) -> int:
+        value = await self.get_setting(OFFER_EXPIRY_HOURS_KEY)
+        return int(value) if value is not None else 6
+
+    async def set_offer_expiry_hours(self, hours: int) -> None:
+        await self.set_setting(OFFER_EXPIRY_HOURS_KEY, str(hours))
+
+    # -------------------------------------------------------- offer run state
+    async def get_offer_active(self) -> bool:
+        return await self.get_setting(OFFER_ACTIVE_KEY, "OFF") == "ON"
+
+    async def get_offer_sent_count(self) -> int:
+        value = await self.get_setting(OFFER_SENT_KEY)
+        return int(value) if value is not None else 0
+
+    async def start_offer_run(self) -> None:
+        """Always unbounded — runs until "🛑 Offer to'xtatish" is tapped.
+        There is no target-count/"send N then stop" concept at all."""
+        await self.set_setting(OFFER_ACTIVE_KEY, "ON")
+        await self.set_setting(OFFER_SENT_KEY, "0")
+
+    async def stop_offer_run(self) -> None:
+        await self.set_setting(OFFER_ACTIVE_KEY, "OFF")
+
+    async def increment_offer_sent_count(self) -> int:
+        sent = await self.get_offer_sent_count() + 1
+        await self.set_setting(OFFER_SENT_KEY, str(sent))
+        return sent
+
+    async def get_offer_selected_gift_types(self) -> set:
+        value = await self.get_setting(OFFER_SELECTED_GIFT_TYPES_KEY, "")
+        if not value:
+            return set()
+        return {int(x) for x in value.split(",") if x}
+
+    async def set_offer_selected_gift_types(self, gift_ids) -> None:
+        await self.set_setting(
+            OFFER_SELECTED_GIFT_TYPES_KEY, ",".join(str(g) for g in sorted(gift_ids))
+        )
+
+    async def get_offer_paused(self) -> bool:
+        """True once a BALANCE_TOO_LOW response has paused the auto-offer
+        pipeline — see OfferState.pause()/resume() for the actual
+        transition logic (this is just the persisted flag)."""
+        return await self.get_setting(OFFER_PAUSED_KEY, "OFF") == "ON"
+
+    async def set_offer_paused(self, paused: bool) -> None:
+        await self.set_setting(OFFER_PAUSED_KEY, "ON" if paused else "OFF")
+
+    # -------------------------------------------------------------- offers
+    async def claim_offer_slot(
+        self, offer_id: int, slug: str, gift_id: Optional[int], price_stars: int,
+        duration_seconds: int, expires_at: str, owner_peer_id: Optional[int] = None,
+    ) -> bool:
+        """Atomically claims this slug for an offer attempt — a slug is only
+        ever offered on once, mirroring claim_listing's dedup-via-INSERT
+        pattern. Returns False if this slug already has an offer record.
+
+        `owner_peer_id` (a telethon.utils.get_peer_id-style marked id) is
+        recorded so a later decline can find every other still-PENDING
+        offer to the same seller (see count_pending_offers_for_peer) before
+        removing them from the "Offer" chat folder.
+        """
+        try:
+            await self._conn.execute(
+                """
+                INSERT INTO star_gift_offers(
+                    offer_id, slug, gift_id, price_stars, duration_seconds,
+                    status, created_at, expires_at, updated_at, owner_peer_id
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    offer_id, slug, gift_id, price_stars, duration_seconds,
+                    OfferStatus.PENDING, _now(), expires_at, _now(), owner_peer_id,
+                ),
+            )
+            await self._conn.commit()
+            return True
+        except aiosqlite.IntegrityError:
+            return False
+
+    async def get_offer_owner_peer_id(self, slug: str) -> Optional[int]:
+        cur = await self._conn.execute(
+            "SELECT owner_peer_id FROM star_gift_offers WHERE slug = ?", (slug,)
+        )
+        row = await cur.fetchone()
+        return row["owner_peer_id"] if row and row["owner_peer_id"] is not None else None
+
+    async def count_pending_offers_for_peer(self, owner_peer_id: int) -> int:
+        cur = await self._conn.execute(
+            "SELECT COUNT(*) FROM star_gift_offers WHERE owner_peer_id = ? AND status = ?",
+            (owner_peer_id, OfferStatus.PENDING),
+        )
+        row = await cur.fetchone()
+        return row[0] if row else 0
+
+    async def mark_offer_failed(self, slug: str, error_message: str) -> None:
+        await self._conn.execute(
+            "UPDATE star_gift_offers SET status = ?, error_message = ?, updated_at = ? WHERE slug = ?",
+            (OfferStatus.FAILED, error_message, _now(), slug),
+        )
+        await self._conn.commit()
+
+    async def update_offer_status(self, slug: str, status: str) -> None:
+        await self._conn.execute(
+            "UPDATE star_gift_offers SET status = ?, updated_at = ? WHERE slug = ?",
+            (status, _now(), slug),
+        )
+        await self._conn.commit()
+
+    async def expire_stale_offers(self) -> int:
+        """Marks every still-PENDING offer whose expiry has passed as
+        EXPIRED. Telegram auto-refunds the reserved Stars on its own side;
+        this only keeps our local record in sync. Returns how many rows
+        were flipped."""
+        cur = await self._conn.execute(
+            "UPDATE star_gift_offers SET status = ?, updated_at = ? WHERE status = ? AND expires_at <= ?",
+            (OfferStatus.EXPIRED, _now(), OfferStatus.PENDING, _now()),
+        )
+        await self._conn.commit()
+        return cur.rowcount
+
+    async def get_offer_stats(self) -> dict:
+        async def scalar(query: str, params: tuple = ()) -> int:
+            cur = await self._conn.execute(query, params)
+            row = await cur.fetchone()
+            return row[0] if row else 0
+
+        total = await scalar("SELECT COUNT(*) FROM star_gift_offers")
+        pending = await scalar(
+            "SELECT COUNT(*) FROM star_gift_offers WHERE status = ?", (OfferStatus.PENDING,)
+        )
+        accepted = await scalar(
+            "SELECT COUNT(*) FROM star_gift_offers WHERE status = ?", (OfferStatus.ACCEPTED,)
+        )
+        declined = await scalar(
+            "SELECT COUNT(*) FROM star_gift_offers WHERE status = ?", (OfferStatus.DECLINED,)
+        )
+        expired = await scalar(
+            "SELECT COUNT(*) FROM star_gift_offers WHERE status = ?", (OfferStatus.EXPIRED,)
+        )
+        failed = await scalar(
+            "SELECT COUNT(*) FROM star_gift_offers WHERE status = ?", (OfferStatus.FAILED,)
+        )
+        return {
+            "total": total,
+            "pending": pending,
+            "accepted": accepted,
+            "declined": declined,
+            "expired": expired,
+            "failed": failed,
+        }
 
     # -------------------------------------------------------------- listings
     async def claim_listing(

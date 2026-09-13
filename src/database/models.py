@@ -40,4 +40,19 @@ CREATE TABLE IF NOT EXISTS application_settings (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS star_gift_offers (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    offer_id INTEGER NOT NULL,
+    slug TEXT NOT NULL UNIQUE,
+    gift_id INTEGER,
+    price_stars INTEGER NOT NULL,
+    duration_seconds INTEGER NOT NULL,
+    status TEXT NOT NULL,
+    error_message TEXT,
+    created_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    owner_peer_id INTEGER
+);
 """

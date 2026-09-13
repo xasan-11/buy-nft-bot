@@ -32,3 +32,19 @@ async def test_startpo_stopo_toggle_persists(repo):
 
     await repo.set_verbose_poll_log(False)
     assert await repo.get_verbose_poll_log() is False
+
+
+async def test_verbose_poll_interval_defaults_to_5(repo):
+    assert await repo.get_verbose_poll_interval() == 5
+
+
+async def test_verbose_poll_interval_can_be_set_to_zero_for_immediate_mode(repo):
+    await repo.set_verbose_poll_interval(0)
+    assert await repo.get_verbose_poll_interval() == 0
+
+
+async def test_verbose_poll_interval_updates_and_persists(repo):
+    await repo.set_verbose_poll_interval(1)
+    assert await repo.get_verbose_poll_interval() == 1
+    await repo.set_verbose_poll_interval(30)
+    assert await repo.get_verbose_poll_interval() == 30

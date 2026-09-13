@@ -62,6 +62,7 @@ class FakeNotifier:
         self.ignored = []
         self.failed = []
         self.checked = []
+        self.checked_batches = []
 
     async def notify_purchased(self, slug, price, channel_username):
         self.purchased.append((slug, price, channel_username))
@@ -74,6 +75,9 @@ class FakeNotifier:
 
     async def notify_listing_checked(self, name, price, link):
         self.checked.append((name, price, link))
+
+    async def notify_listings_checked_batch(self, items, interval):
+        self.checked_batches.append((items, interval))
 
 
 def make_executor(outcome: PurchaseOutcome):
@@ -239,10 +243,14 @@ async def test_verbose_poll_log_off_by_default_sends_no_checked_notification(rep
     await monitor.handle_candidate(gift_id=1, unique=FakeUniqueGift("MarketGift-7", 999, title="Plush Pepe"))
 
     assert notifier.checked == []
+    assert monitor._verbose_buffer == []
 
 
-async def test_verbose_poll_log_on_notifies_for_every_candidate(repo):
+async def test_verbose_immediate_mode_notifies_right_away(repo):
+    """interval == 0 means the old "one message per listing, immediately"
+    behavior — no batching, no waiting for a flush."""
     await repo.set_verbose_poll_log(True)
+    await repo.set_verbose_poll_interval(0)
     client = FakeMarketClient()
     executor = make_executor(PurchaseOutcome(success=True, price_stars=999))
     monitor, notifier, _ = await make_market_monitor(repo, client, executor=executor)
@@ -254,12 +262,59 @@ async def test_verbose_poll_log_on_notifies_for_every_candidate(repo):
     assert name == "Plush Pepe"
     assert price == 999
     assert link == "https://t.me/nft/MarketGift-8"
+    assert monitor._verbose_buffer == []  # nothing left to flush
+
+
+async def test_verbose_aggregated_mode_buffers_instead_of_sending(repo):
+    """interval > 0 (the default, 5s) must NOT send a message per listing —
+    it accumulates into the buffer for verbose_flush_loop to drain."""
+    await repo.set_verbose_poll_log(True)  # default interval stays 5
+    client = FakeMarketClient()
+    executor = make_executor(PurchaseOutcome(success=True, price_stars=100))
+    monitor, notifier, _ = await make_market_monitor(repo, client, executor=executor)
+
+    await monitor.handle_candidate(gift_id=1, unique=FakeUniqueGift("MarketGift-8b", 100, title="Plush Pepe"))
+
+    assert notifier.checked == []  # not sent immediately
+    assert len(monitor._verbose_buffer) == 1
+    name, price, link = monitor._verbose_buffer[0]
+    assert name == "Plush Pepe"
+    assert price == 100
+
+
+async def test_flush_verbose_buffer_sends_one_aggregated_message(repo):
+    await repo.set_verbose_poll_log(True)
+    client = FakeMarketClient()
+    executor = make_executor(PurchaseOutcome(success=True, price_stars=100))
+    monitor, notifier, _ = await make_market_monitor(repo, client, executor=executor)
+
+    await monitor.handle_candidate(gift_id=1, unique=FakeUniqueGift("A", 100, title="Gift A"))
+    await monitor.handle_candidate(gift_id=1, unique=FakeUniqueGift("B", 150, title="Gift B"))
+
+    await monitor.flush_verbose_buffer(interval=5)
+
+    assert len(notifier.checked_batches) == 1
+    items, interval = notifier.checked_batches[0]
+    assert interval == 5
+    assert [i[0] for i in items] == ["Gift A", "Gift B"]
+    assert monitor._verbose_buffer == []  # drained
+
+
+async def test_flush_verbose_buffer_sends_nothing_when_empty(repo):
+    await repo.set_verbose_poll_log(True)
+    client = FakeMarketClient()
+    monitor, notifier, _ = await make_market_monitor(repo, client)
+
+    await monitor.flush_verbose_buffer(interval=5)
+
+    assert notifier.checked_batches == []
 
 
 async def test_verbose_poll_log_fires_even_for_over_budget_listing(repo):
     """Explicitly required: verbose mode reports a listing even when its
     price is above MAX_NFT_PRICE (it would otherwise just be ignored)."""
     await repo.set_verbose_poll_log(True)
+    await repo.set_verbose_poll_interval(0)
     client = FakeMarketClient()
     executor = make_executor(PurchaseOutcome(success=True, price_stars=5000))
     monitor, notifier, _ = await make_market_monitor(repo, client, executor=executor)
@@ -271,11 +326,12 @@ async def test_verbose_poll_log_fires_even_for_over_budget_listing(repo):
     assert executor.calls == []  # and never purchased
 
 
-async def test_verbose_poll_log_fires_again_on_duplicate_scan(repo):
-    """The spec asks for a message per listing found *this cycle*, so a
-    still-listed gift re-seen on a later poll gets reported again even
-    though claim_listing rejects it as a duplicate."""
+async def test_verbose_does_not_repeat_for_a_listing_already_seen(repo):
+    """A listing must be reported (verbose or otherwise) at most once in
+    its lifetime — a still-listed gift re-seen on a later poll must NOT be
+    reported again, whether via the immediate or the aggregated path."""
     await repo.set_verbose_poll_log(True)
+    await repo.set_verbose_poll_interval(0)
     client = FakeMarketClient()
     executor = make_executor(PurchaseOutcome(success=True, price_stars=100))
     monitor, notifier, _ = await make_market_monitor(repo, client, executor=executor)
@@ -284,5 +340,71 @@ async def test_verbose_poll_log_fires_again_on_duplicate_scan(repo):
     await monitor.handle_candidate(gift_id=1, unique=unique)
     await monitor.handle_candidate(gift_id=1, unique=unique)
 
-    assert len(notifier.checked) == 2
+    assert len(notifier.checked) == 1  # NOT 2 — no repeat on the second sighting
     assert executor.calls == ["MarketGift-10"]  # still only purchased once
+
+
+async def test_verbose_aggregated_mode_does_not_rebuffer_already_seen_listing(repo):
+    await repo.set_verbose_poll_log(True)  # default interval stays 5 (buffered)
+    client = FakeMarketClient()
+    executor = make_executor(PurchaseOutcome(success=True, price_stars=100))
+    monitor, notifier, _ = await make_market_monitor(repo, client, executor=executor)
+
+    unique = FakeUniqueGift("MarketGift-10b", 100)
+    await monitor.handle_candidate(gift_id=1, unique=unique)
+    await monitor.handle_candidate(gift_id=1, unique=unique)
+
+    assert len(monitor._verbose_buffer) == 1  # not added twice
+
+
+async def test_first_scan_processes_existing_listings_like_new_ones(repo):
+    """Regression/confirmation test: the very first scan_once() call (e.g.
+    right after /startg on an empty database) must evaluate every
+    currently-listed resale gift exactly like a later "newly appeared"
+    one — there is no "ignore the first snapshot" special case anywhere in
+    claim_listing/handle_candidate."""
+    client = FakeMarketClient(
+        star_gifts_result=FakeGetStarGiftsResult([FakeStarGiftType(1, availability_resale=3)]),
+        resale_by_gift_id={
+            1: [
+                FakeUniqueGift("Existing-1", 100),  # within budget (<=200)
+                FakeUniqueGift("Existing-2", 150),  # within budget
+                FakeUniqueGift("Existing-3", 999),  # over budget
+            ]
+        },
+    )
+    executor = make_executor(PurchaseOutcome(success=True, price_stars=100))
+    monitor, notifier, _ = await make_market_monitor(repo, client, executor=executor)
+
+    await monitor.scan_once()
+
+    # All three pre-existing listings were claimed and evaluated, not skipped.
+    for slug in ("Existing-1", "Existing-2", "Existing-3"):
+        assert await repo.get_listing(slug) is not None
+    assert sorted(executor.calls) == ["Existing-1", "Existing-2"]  # bought, within budget
+    assert notifier.ignored  # Existing-3 was evaluated and ignored, not skipped
+
+    # The one-time confirmation log's tallies must reflect this.
+    assert monitor._first_scan_logged is True
+    assert monitor._cycle_new_count == 3
+    assert monitor._cycle_within_budget_count == 2
+
+
+async def test_first_scan_log_message_is_emitted_once(repo, caplog):
+    import logging
+
+    client = FakeMarketClient(
+        star_gifts_result=FakeGetStarGiftsResult([FakeStarGiftType(1, availability_resale=1)]),
+        resale_by_gift_id={1: [FakeUniqueGift("Existing-4", 50)]},
+    )
+    executor = make_executor(PurchaseOutcome(success=True, price_stars=50))
+    monitor, notifier, _ = await make_market_monitor(repo, client, executor=executor)
+
+    with caplog.at_level(logging.INFO, logger="market_monitor"):
+        await monitor.scan_once()
+        await monitor.scan_once()  # second cycle: must NOT log "Birinchi tekshiruv" again
+
+    first_scan_logs = [r for r in caplog.records if "Birinchi tekshiruv" in r.message]
+    assert len(first_scan_logs) == 1
+    assert "1 ta mavjud listing topildi" in first_scan_logs[0].message
+    assert "1 tasi MAX_NFT_PRICE dan past" in first_scan_logs[0].message

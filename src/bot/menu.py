@@ -21,8 +21,12 @@ ADMIN_COMMANDS = [
     ("startg", "Start resale gift market monitoring"),
     ("stopg", "Stop resale gift market monitoring"),
     ("setmaxprice", "Set the maximum auto-purchase price in Stars"),
-    ("startpo", "Har tekshiruvni ko'rsatish (verbose polling log)"),
-    ("stopo", "Ko'rsatishni to'xtatish (verbose polling log)"),
+    ("startpo", "Verbose polling: /startpo <N> soniya (0 = har biri alohida)"),
+    ("stopo", "Verbose pollingni to'xtatish"),
+    ("setofferlevel", "Offer uchun sotuvchi darajasi shartini o'rnatish"),
+    ("setoffernftcount", "Offer uchun sotuvchi NFT soni chegarasini o'rnatish"),
+    ("setofferprice", "Offer narxini Stars'da o'rnatish"),
+    ("setofferexpiry", "Offer amal qilish muddatini soatda o'rnatish"),
 ]
 
 # Shown to everyone else — deliberately minimal, reveals no admin capability.

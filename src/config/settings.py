@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Optional
 
 from dotenv import load_dotenv
 
@@ -21,7 +22,8 @@ def _int_env(name: str, default: int) -> int:
 class Settings:
     api_id: int
     api_hash: str
-    phone: str
+    phone: Optional[str]
+    session_string: str
     bot_token: str
     owner_id: int
     max_nft_price: int
@@ -35,7 +37,9 @@ class Settings:
     def load(cls) -> "Settings":
         api_id_raw = os.getenv("TELEGRAM_API_ID")
         api_hash = os.getenv("TELEGRAM_API_HASH")
-        phone = os.getenv("TELEGRAM_PHONE")
+        # Optional: if unset, the control-bot login flow (login_flow.py)
+        # asks the owner for it via /login <phone> instead of assuming one.
+        phone = os.getenv("TELEGRAM_PHONE") or None
         bot_token = os.getenv("CONTROL_BOT_TOKEN")
         owner_raw = os.getenv("OWNER_TELEGRAM_ID")
 
@@ -44,7 +48,6 @@ class Settings:
             for name, val in [
                 ("TELEGRAM_API_ID", api_id_raw),
                 ("TELEGRAM_API_HASH", api_hash),
-                ("TELEGRAM_PHONE", phone),
                 ("CONTROL_BOT_TOKEN", bot_token),
                 ("OWNER_TELEGRAM_ID", owner_raw),
             ]
@@ -62,6 +65,7 @@ class Settings:
             api_id=int(api_id_raw),
             api_hash=api_hash,
             phone=phone,
+            session_string=os.getenv("TELEGRAM_SESSION_STRING", ""),
             bot_token=bot_token,
             owner_id=int(owner_raw),
             max_nft_price=_int_env("MAX_NFT_PRICE", 200),

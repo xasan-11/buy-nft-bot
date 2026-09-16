@@ -23,10 +23,24 @@ def build_user_client(settings: Settings, session_string: str = "") -> TelegramC
     after connecting, drives login through the control bot instead of
     failing — see telegram/user_manager.py.
     """
-    return TelegramClient(StringSession(session_string), settings.api_id, settings.api_hash)
+    return TelegramClient(
+        StringSession(session_string),
+        settings.api_id,
+        settings.api_hash,
+        connection_retries=settings.connection_retries,
+        retry_delay=settings.retry_delay,
+        timeout=settings.connection_timeout,
+    )
 
 
 def build_bot_client(settings: Settings) -> TelegramClient:
     """The admin-only control bot (separate Bot API account via BotFather)."""
     session_path = settings.session_dir / "bot_session"
-    return TelegramClient(str(session_path), settings.api_id, settings.api_hash)
+    return TelegramClient(
+        str(session_path),
+        settings.api_id,
+        settings.api_hash,
+        connection_retries=settings.connection_retries,
+        retry_delay=settings.retry_delay,
+        timeout=settings.connection_timeout,
+    )

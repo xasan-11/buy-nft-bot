@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import datetime as dt
 import logging
 import re
 from asyncio import Event
@@ -9,6 +10,7 @@ from typing import Dict, Optional
 
 from telethon import events
 from telethon.errors import (
+    ApiIdInvalidError,
     PhoneCodeExpiredError,
     PhoneCodeInvalidError,
     SessionPasswordNeededError,
@@ -27,6 +29,22 @@ def _digits_only(raw: Optional[str]) -> str:
     """Strips everything but digits from a /code argument, so a code sent
     as "9.9.9.9.9" (or with spaces/dashes) is read as "99999"."""
     return re.sub(r"\D", "", raw) if raw else ""
+
+
+def _mask_phone(phone: Optional[str]) -> str:
+    """Partially hides a phone number for the owner login notification —
+    keeps the leading "+<country code>"-ish prefix and the last 2 digits,
+    replacing everything else with asterisks (e.g. "+998901234548" ->
+    "+998*******48"). Never exposes the full number. A phone too short to
+    meaningfully mask (or missing entirely) is reported as unknown rather
+    than shown outright."""
+    if not phone:
+        return "noma'lum"
+    phone = phone.strip()
+    if len(phone) <= 6:
+        return "noma'lum"
+    prefix, suffix = phone[:4], phone[-2:]
+    return prefix + ("*" * (len(phone) - len(prefix) - len(suffix))) + suffix
 
 
 @dataclass
@@ -168,13 +186,70 @@ class UserSessionManager:
             stored = await self.repo.get_user_session(telegram_id)
             client = build_user_client(self.settings, stored)
             self.clients[telegram_id] = client
-            await client.connect()
         return client
+
+    async def _ensure_connected(self, telegram_id: int, client) -> bool:
+        """Reconnects a client whose MTProto connection has dropped
+        (network blip, idle server-side disconnect, proxy failure, etc.)
+        before any request is sent through it. Without this check,
+        send_code_request()/sign_in() fail with "Cannot send requests
+        while disconnected" — and since the same disconnected client
+        object keeps getting handed back on every retry, the same call
+        would otherwise fail identically forever."""
+        if client.is_connected():
+            return True
+        logger.warning("Telegram client for user %s is disconnected — reconnecting", telegram_id)
+        try:
+            await client.connect()
+        except ApiIdInvalidError:
+            logger.exception(
+                "Reconnect failed for user %s: TELEGRAM_API_ID/TELEGRAM_API_HASH are invalid",
+                telegram_id,
+            )
+            return False
+        except (asyncio.TimeoutError, ConnectionError, OSError):
+            logger.exception(
+                "Reconnect failed for user %s: network/proxy problem while connecting to Telegram",
+                telegram_id,
+            )
+            return False
+        except Exception:
+            logger.exception("Reconnect failed for user %s with an unexpected error", telegram_id)
+            return False
+        if not client.is_connected():
+            logger.error("Telegram client for user %s still disconnected after connect()", telegram_id)
+            return False
+        return True
 
     async def _request_code(self, telegram_id: int, phone: str, event) -> None:
         client = await self._get_or_create_client(telegram_id)
+        if not await self._ensure_connected(telegram_id, client):
+            await self._reply(
+                telegram_id, event,
+                "❌ Telegramga ulanib bo'lmadi. Internet aloqasi yoki proksi sozlamalarini "
+                "tekshirib, birozdan so'ng qaytadan /login urinib ko'ring.",
+            )
+            return
         try:
             sent = await client.send_code_request(phone)
+        except ApiIdInvalidError:
+            logger.exception(
+                "send_code_request failed for user %s: TELEGRAM_API_ID/TELEGRAM_API_HASH are invalid",
+                telegram_id,
+            )
+            await self._reply(telegram_id, event, "❌ Kod yuborishda xatolik: API sozlamalari noto'g'ri.")
+            return
+        except (asyncio.TimeoutError, ConnectionError, OSError):
+            logger.exception(
+                "send_code_request failed for user %s: network/proxy problem or connection dropped "
+                "mid-request",
+                telegram_id,
+            )
+            await self._reply(
+                telegram_id, event,
+                "❌ Kod yuborishda xatolik: tarmoq bilan bog'liq muammo. Birozdan so'ng qaytadan urinib ko'ring.",
+            )
+            return
         except Exception as e:
             logger.exception("Failed to send login code to %s for user %s", phone, telegram_id)
             await self._reply(telegram_id, event, f"❌ Kod yuborishda xatolik: {e}")
@@ -192,6 +267,14 @@ class UserSessionManager:
     async def _submit_code(self, telegram_id: int, code: str, event) -> None:
         progress = self._login_progress[telegram_id]
         client = self.clients[telegram_id]
+        if not await self._ensure_connected(telegram_id, client):
+            progress.awaiting = None
+            await self._reply(
+                telegram_id, event,
+                "❌ Telegramga ulanish uzilgan va qayta ulanib bo'lmadi. "
+                f"Qaytadan /login {progress.phone} deb yozing.",
+            )
+            return
         try:
             await client.sign_in(phone=progress.phone, code=code, phone_code_hash=progress.phone_code_hash)
         except SessionPasswordNeededError:
@@ -214,6 +297,12 @@ class UserSessionManager:
 
     async def _submit_password(self, telegram_id: int, password: str, event) -> None:
         client = self.clients[telegram_id]
+        if not await self._ensure_connected(telegram_id, client):
+            await self._reply(
+                telegram_id, event,
+                "❌ Telegramga ulanish uzilgan va qayta ulanib bo'lmadi. Qaytadan /login deb yozing.",
+            )
+            return
         try:
             await client.sign_in(password=password)
         except Exception as e:
@@ -231,11 +320,55 @@ class UserSessionManager:
             await self.repo.set_user_session(telegram_id, session_string, phone)
             logger.info("Saved session for user %s.", telegram_id)
         await self._activate(telegram_id, client)
+        await self._notify_owner_of_login(telegram_id, client, phone)
         await self._reply(
             telegram_id, event,
             "✅ Muvaffaqiyatli login qilindi. Endi offer sozlamalaringizni o'rnatib, "
             "\"🎯 Offer boshlash\" orqali offer tashlashni boshlashingiz mumkin.",
         )
+
+    async def _notify_owner_of_login(self, telegram_id: int, client, phone: Optional[str]) -> None:
+        """Tells the owner every time someone else's bot-mediated /login
+        flow (phone -> code -> optional 2FA) actually completes — i.e.
+        only from here, never from restore_all() reconnecting an already-
+        existing session on restart, and never for a failed/expired code
+        (those return early in _submit_code/_submit_password without ever
+        reaching _finish). The owner's own login is deliberately not
+        self-reported — they already know.
+
+        Best-effort throughout: a failure fetching the profile or sending
+        the notification must never break the login flow itself for the
+        user who just authenticated.
+        """
+        if telegram_id == self.settings.owner_id:
+            return
+
+        display = f"ID {telegram_id}"
+        try:
+            me = await client.get_me()
+            name = " ".join(
+                part for part in (getattr(me, "first_name", None), getattr(me, "last_name", None)) if part
+            )
+            username = getattr(me, "username", None)
+            if username:
+                display = f"@{username}"
+            elif name:
+                display = name
+        except Exception:
+            logger.exception(
+                "Failed to fetch profile info for owner login notification (user %s)", telegram_id
+            )
+
+        timestamp = dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%d %H:%M")
+        text = (
+            f"🔑 Yangi login: {display} (ID: {telegram_id}) o'z akkountini ulashdi.\n"
+            f"Telefon: {_mask_phone(phone)}\n"
+            f"Vaqt: {timestamp}"
+        )
+        try:
+            await self.bot_client.send_message(self.settings.owner_id, text)
+        except Exception:
+            logger.exception("Failed to notify owner about login by user %s", telegram_id)
 
     # ------------------------------------------------------------ activation
     async def _activate(self, telegram_id: int, client) -> None:
@@ -272,7 +405,8 @@ class UserSessionManager:
                 client = build_user_client(self.settings, session_string)
                 self.clients[telegram_id] = client
             try:
-                await client.connect()
+                if not await self._ensure_connected(telegram_id, client):
+                    continue
                 if await client.is_user_authorized():
                     await self._activate(telegram_id, client)
                     logger.info("Restored session for user %s.", telegram_id)

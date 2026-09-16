@@ -32,6 +32,9 @@ class Settings:
     market_poll_interval_seconds: int
     session_dir: Path
     db_path: Path
+    connection_retries: int
+    retry_delay: int
+    connection_timeout: int
 
     @classmethod
     def load(cls) -> "Settings":
@@ -76,4 +79,11 @@ class Settings:
             market_poll_interval_seconds=_int_env("MARKET_POLL_INTERVAL_SECONDS", 5),
             session_dir=data_dir,
             db_path=data_dir / "app.db",
+            # Telethon's MTProto connection retries/backoff — bumped above
+            # Telethon's own defaults (5 retries / 1s delay) since an
+            # unstable network otherwise leaves the client permanently
+            # disconnected mid-login (see telegram/user_manager.py).
+            connection_retries=_int_env("TELEGRAM_CONNECTION_RETRIES", 10),
+            retry_delay=_int_env("TELEGRAM_RETRY_DELAY", 2),
+            connection_timeout=_int_env("TELEGRAM_CONNECTION_TIMEOUT", 10),
         )

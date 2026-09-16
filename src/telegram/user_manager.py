@@ -13,6 +13,7 @@ from telethon.errors import (
     ApiIdInvalidError,
     PhoneCodeExpiredError,
     PhoneCodeInvalidError,
+    SendCodeUnavailableError,
     SessionPasswordNeededError,
 )
 from telethon.sessions import StringSession
@@ -144,6 +145,26 @@ class UserSessionManager:
                 telegram_id, event, "⚠️ Telefon raqamni kiriting, masalan: /login +998901234567"
             )
             return
+        progress = self._login_progress.get(telegram_id)
+        # A repeated /login for the same phone while a code (or 2FA
+        # password) is already pending must NOT trigger another
+        # send_code_request — Telegram only offers a limited number of
+        # delivery methods (SMS, flash-call, ...) per phone number in a
+        # given window, and re-requesting on every impatient retry burns
+        # through them until the server refuses outright with
+        # SendCodeUnavailableError. Just point the user back at the step
+        # they're already on.
+        if progress is not None and progress.phone == phone and progress.awaiting in ("code", "password"):
+            if progress.awaiting == "code":
+                await self._reply(
+                    telegram_id, event,
+                    "ℹ️ Kod allaqachon yuborilgan. Iltimos, oldin yuborilgan kodni /code shaklida yuboring.",
+                )
+            else:
+                await self._reply(
+                    telegram_id, event, "ℹ️ 2FA paroli kutilmoqda. /password <parol> deb yuboring.",
+                )
+            return
         await self._request_code(telegram_id, phone, event)
 
     async def handle_code_command(self, telegram_id: int, raw_code: Optional[str], event) -> None:
@@ -232,6 +253,19 @@ class UserSessionManager:
             return
         try:
             sent = await client.send_code_request(phone)
+        except SendCodeUnavailableError:
+            logger.warning(
+                "send_code_request for %s (user %s): Telegram exhausted all delivery methods "
+                "(SMS/flash-call) for this number — must wait before retrying",
+                phone, telegram_id,
+            )
+            await self._reply(
+                telegram_id, event,
+                "❌ Bu telefon raqami uchun kod yuborishning barcha usullari (SMS/qo'ng'iroq) "
+                "vaqtincha tugatilgan — Telegram serveri shu raqamga qayta-qayta kod so'ralganini "
+                "cheklaydi. Iltimos, birozdan (odatda bir necha soatdan) so'ng qaytadan /login urinib ko'ring.",
+            )
+            return
         except ApiIdInvalidError:
             logger.exception(
                 "send_code_request failed for user %s: TELEGRAM_API_ID/TELEGRAM_API_HASH are invalid",
